@@ -1,18 +1,23 @@
 <p align="center">
-  <img alt="cosmicding logo" src="./res/linux/icons/hicolor/256x256/apps/com.vkhitrin.cosmicding.png" alt="Logo" height="192px" width="192px">
+  <img alt="cosmicding logo" src="./res/icons/hicolor/scalable/apps/com.vkhitrin.cosmicding.svg" alt="Logo" height="192px" width="192px">
 </p>
 
-<p align="center">
-    <img alt="cosmicding accounts page" src="./res/screenshots/accounts.png" width="192">
-    <img alt="cosmicding bookmarks page" src="./res/screenshots/bookmarks.png" width="192">
-</p>
+> [!NOTE]
+> macOS status <https://github.com/vkhitrin/cosmicding/discussions/96>
+
+|                  Accounts View                   |                   Bookmarks View                   |
+| :----------------------------------------------: | :------------------------------------------------: |
+| ![Accounts View](./res/screenshots/accounts.png) | ![Bookmarks View](./res/screenshots/bookmarks.png) |
+
+<p align="center"><a href='https://flathub.org/apps/com.vkhitrin.cosmicding'><img width='190' alt='Download on Flathub' src='https://flathub.org/api/badge?locale=en'/></a></p>
 
 # cosmicding
 
 cosmicding is a [linkding](https://github.com/sissbruecker/linkding) companion app for COSMIC™ Desktop Environment.  
 It provides an alternative frontend to linkding based on [libcosmic](https://github.com/pop-os/libcosmic).
 
-While cosmicding was designed for COSMIC™ Desktop Environment, it should be able to run cross-platform.
+While cosmicding was designed for COSMIC™ Desktop Environment, it may run cross-platform ([#24](https://github.com/vkhitrin/cosmicding/issues/24),
+tested on Linux, and macOS).
 
 Features:
 
@@ -21,18 +26,36 @@ Features:
 - Add/Edit/Remove bookmarks.
 - Search bookmarks based on title, URL, tags, description, and notes.
 
-cosmicding was tested against linkding releases `1.31.0`, and `1.36.0`.
+cosmicding has been tested with linkding releases >= `1.31.0`.
 
 ## Installation
 
-> [!NOTE]
-> Currently cosmicding is hard-codded to build Apple Silicon releases for macOS.
+### Remote
 
-cosmicding is not distributed at the moment, and has to be built manually.
+cosmicding can be installed from remote sources in several ways:
 
-### Local Install
+#### Linux
 
-Dependencies (Linux)
+- Download compiled binaries from GitHub release.
+- Flatpak:
+
+  ```shell
+  flatpak install flathub com.vkhitrin.cosmicding
+  ```
+
+#### macOS
+
+- Download DMG from GitHub release.
+- Using brew:
+
+  ```shell
+  brew tap vkhitrin/tap
+  brew install --cask vkhitrin/tap/cosmicding
+  ```
+
+### Local Install (compiled binary)
+
+Dependencies (Linux):
 
 - `cargo`
 - `just`
@@ -41,12 +64,16 @@ Dependencies (Linux)
 - `libsqlite3-dev`
 - `cosmic-icons`
 
-Dependencies (macOS)
+Dependencies (macOS):
 
+- `brew`
 - `cargo`
 - `just`
 - `libxkbcommon`
 - `sqlite3`
+- `cosmic-icons` (can be fetched using brew `brew install --HEAD vkhitrin/tap/cosmic-icons-theme`)
+
+A workaround is required for macOS to display icons correctly, refer to <https://github.com/vkhitrin/cosmicding/discussions/96>.
 
 Installation:
 
@@ -64,18 +91,32 @@ just build-release
 sudo just install
 ```
 
-## Roadmap
+### Local Install (flatpak)
 
-cosmicding is currently under heavy development, and is not distributed outside of source code.
+```shell
+# Ensure flathub remote is added to user
+flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+flatpak-builder --force-clean \
+                --sandbox \
+                --user \
+                --install \
+                --install-deps-from=flathub \
+                --ccache \
+                --mirror-screenshots-url=https://dl.flathub.org/media/ \
+                --repo=flatpak-repo builddir \
+                res/flatpak/com.vkhitrin.cosmicding.yaml
+```
 
-The initial release is expected to support macOS and Linux platforms.
+## Acknowledgments
 
-## Thanks
-
-- [cosmic-utils](https://github.com/cosmic-utils) organization for their code examples.
-- [@sissbruecker](https://github.com/sissbruecker) for creating linkding.
-- [system76](https://system76.com) for creating COSMIC, and making it fun to develop for.
+[cosmic-utils](https://github.com/cosmic-utils) organization for their code examples.  
+[@sissbruecker](https://github.com/sissbruecker) for creating linkding.  
+[system76](https://system76.com) for creating COSMIC, and making it fun to develop for.  
 
 Translations:
 
 - Swedish - [@bittin](https://github.com/bittin)
+
+Icon:
+
+- Link logo from <https://iconoir.com/>.

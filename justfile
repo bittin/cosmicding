@@ -1,6 +1,5 @@
 name := 'cosmicding'
 appid := 'com.vkhitrin.cosmicding'
-migrations_folder := clean(rootdir / prefix) / 'share' / appid / 'migrations'
 
 rootdir := ''
 prefix := '/usr'
@@ -14,23 +13,22 @@ desktop := appid + '.desktop'
 desktop-src := 'res' / 'linux' / desktop
 desktop-dst := clean(rootdir / prefix) / 'share' / 'applications' / desktop
 
-icons-src := 'res' / 'linux' / 'icons' / 'hicolor'
+metainfo-dst := clean(rootdir / prefix) / 'share' / 'metainfo' / 'com.vkhitrin.cosmicding.metainfo.xml'
+
+icons-src := 'res' / 'icons' / 'hicolor'
 icons-dst := clean(rootdir / prefix) / 'share' / 'icons' / 'hicolor'
 
-# NOTE: macOS related, should be consolidated
-assets-dir := 'res' / 'macOS'
-release-dir := 'target' / 'release'
-app-name := name + '.app'
-app-template := assets-dir / app-name
-app-template-plist := app-template / 'Contents' / 'Info.plist'
-app-dir := release-dir / 'macos'
-app-binary := release-dir / name
-app-binary-dir := app-dir / app-name / 'Contents' / 'MacOS'
-app-extras-dir := app-dir / app-name / 'Contents' / 'Resources'
-dmg-name := name + '.dmg'
-dmg-release := release-dir / 'macos'
-version := '0.1.0'
-build := 'test'
+macos-assets-dir := 'res' / 'macOS'
+macos-release-dir := 'target' / 'release'
+macos-app-name := 'Cosmicding' + '.app'
+macos-app-template := macos-assets-dir / macos-app-name
+macos-app-template-plist := macos-app-template / 'Contents' / 'Info.plist'
+macos-app-dir := macos-release-dir / 'macos'
+macos-app-binary := macos-release-dir / name
+macos-app-binary-dir := macos-app-dir / macos-app-name / 'Contents' / 'MacOS'
+macos-app-extras-dir := macos-app-dir / macos-app-name / 'Contents' / 'Resources'
+macos-dmg-name := name + '.dmg'
+macos-dmg-release := macos-release-dir / 'macos'
 
 default: build-release
 
@@ -50,27 +48,91 @@ build-release *args:
   if [ "$(uname)" = "Linux" ]; then
     just build-release-linux
   elif [ "$(uname)" = "Darwin" ]; then
-    just build-release-macos
+    export HOMEBREW_PREFIX="$(brew --prefix)"
+    export PKG_CONFIG_PATH="${HOMEBREW_PREFIX}/lib/pkgconfig"
+    export LIBRARY_PATH="${HOMEBREW_PREFIX}/lib"
+    export C_INCLUDE_PATH="${HOMEBREW_PREFIX}/include"
+    if [ "$(uname -m)" = "arm64" ]; then
+        just build-release-macos-aarch64
+    elif [ "$(uname -m)" = "x86_64" ]; then
+        just build-release-macos-x86_64
+    fi
   fi
+
 build-release-linux *args: (build-debug '--release' args)
 
-build-release-macos *args:
-    cargo build --release --target=aarch64-apple-darwin {{args}}
+build-release-macos-aarch64 *args:
+    #!/usr/bin/env sh
+    if [ ! -z $COSMICDING_UNIVERAL_BUILD ]; then
+        SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+        CFLAGS="-isysroot $SDKROOT"
+        rustup run stable cargo build --release --target aarch64-apple-darwin {{args}}
+    else
+        cargo build --release --target=aarch64-apple-darwin {{args}}
+        lipo "target/aarch64-apple-darwin/release/{{name}}" -create -output "{{macos-app-binary}}"
+        just bundle-macos
+    fi
 
+build-release-macos-x86_64 *args:
+    #!/usr/bin/env sh
+    echo $COSMICDING_UNIVERAL_BUILD
+    if [ ! -z $COSMICDING_UNIVERAL_BUILD ]; then
+        SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+        CFLAGS="-isysroot $SDKROOT"
+        rustup run stable cargo build --release --target x86_64-apple-darwin {{args}}
+    else
+        cargo build --release --target x86_64-apple-darwin {{args}}
+        lipo "target/x86_64-apple-darwin/release/{{name}}" -create -output "{{macos-app-binary}}"
+        just bundle-macos
+    fi
+
+build-release-macos-universal *args:
+    which rustup || exit 1
+    rustup toolchain install stable
+    rustup target add aarch64-apple-darwin
+    rustup target add x86_64-apple-darwin
+    env COSMICDING_UNIVERAL_BUILD=true just build-release-macos-aarch64
+    env COSMICDING_UNIVERAL_BUILD=true just build-release-macos-x86_64
+    lipo "target/aarch64-apple-darwin/release/{{name}}" "target/x86_64-apple-darwin/release/{{name}}" -create -output "{{macos-app-binary}}"
+    just bundle-macos
+
+bundle-macos:
     # Using native macOS' sed
-    /usr/bin/sed -i '' -e "s/__VERSION__/$(cargo pkgid | cut -d "#" -f2)/g" {{app-template-plist}}
-    /usr/bin/sed -i '' -e "s/__BUILD__/$(git describe --always --exclude='*')/g" {{app-template-plist}}
+    /usr/bin/sed -i '' -e "s/__VERSION__/$(cargo pkgid | cut -d "#" -f2)/g" {{macos-app-template-plist}}
+    /usr/bin/sed -i '' -e "s/__BUILD__/$(git describe --always --exclude='*')/g" {{macos-app-template-plist}}
+    mkdir -p "{{macos-app-binary-dir}}"
+    mkdir -p "{{macos-app-extras-dir}}/icons/hicolor"
+    cp -fRp "{{macos-app-template}}" "{{macos-app-dir}}"
+    cp -fp "{{macos-app-binary}}" "{{macos-app-binary-dir}}"
+    cp -r ./res/icons/hicolor/* "{{macos-app-extras-dir}}/icons/hicolor"
+    touch -r "{{macos-app-binary}}" "{{macos-app-dir}}/{{macos-app-name}}"
+    echo "Created '{{macos-app-name}}' in '{{macos-app-dir}}'"
+    git stash -- {{macos-app-template-plist}}
 
-    lipo "target/aarch64-apple-darwin/release/{{name}}" -create -output "{{app-binary}}"
+distribute-macos-dmg:
+    which create-dmg || exit 1
+    create-dmg \
+      --volname "Cosmicding Installer" \
+      --window-pos 200 120 \
+      --window-size 800 400 \
+      --icon-size 100 \
+      --hide-extension "Cosmicding.app" \
+      --icon {{macos-app-name}} 200 160 \
+      --app-drop-link 600 155 \
+      {{macos-app-dir}}/{{macos-dmg-name}} \
+      {{macos-app-dir}}/{{macos-app-name}}
 
-    mkdir -p "{{app-binary-dir}}"
-    mkdir -p "{{app-extras-dir}}/icons/"
-    cp -fRp "{{app-template}}" "{{app-dir}}"
-    cp -fp "{{app-binary}}" "{{app-binary-dir}}"
-    cp ./res/icons/* "{{app-extras-dir}}/icons/"
-    touch -r "{{app-binary}}" "{{app-dir}}/{{app-name}}"
-    echo "Created '{{app-name}}' in '{{app-dir}}'"
-    git stash -- {{app-template-plist}}
+build-release-linux-flatpak:
+    which flatpak-builder || exit 1
+    flatpak-builder --force-clean \
+                    --sandbox \
+                    --user \
+                    --install \
+                    --install-deps-from=flathub \
+                    --ccache \
+                    --mirror-screenshots-url=https://dl.flathub.org/media/ \
+                    --repo=flatpak-repo builddir \
+                    res/flatpak/com.vkhitrin.cosmicding.yaml
 
 build-vendored *args: vendor-extract (build-release '--frozen --offline' args)
 
@@ -83,7 +145,8 @@ run-linux *args:
     env RUST_BACKTRACE=full cargo run --release {{args}}
 
 run-macos:
-    env RUST_BACKTRACE=full {{app-binary-dir}}/{{name}}
+    just build-release
+    env RUST_BACKTRACE=full {{macos-app-binary-dir}}/{{name}}
 
 run *args:
   #!/usr/bin/env sh
@@ -96,30 +159,33 @@ run *args:
 install:
     #!/usr/bin/env sh
     if [ "$(uname)" = "Linux" ]; then
-        just install-migrations
         install -Dm0755 {{bin-src}} {{bin-dst}}
+        find {{icons-src}} -type f -path "*/apps/*.svg" -exec bash -c '
+            for src; do
+                rel_path="${src#{{icons-src}}/}"
+                dst="{{icons-dst}}/$rel_path"
+                install -Dm0644 "$src" "$dst"
+            done
+        ' bash {} +
         install -Dm0644 res/linux/app.desktop {{desktop-dst}}
-        for size in `ls {{icons-src}}`; do \
-            install -Dm0644 "{{icons-src}}/$size/apps/{{appid}}.png" "{{icons-dst}}/$size/apps/{{appid}}.png"; \
-        done
+        install -Dm0644 res/flatpak/com.vkhitrin.cosmicding.metainfo.xml {{metainfo-dst}}
     elif [ "$(uname)" = "Darwin" ]; then
-        cp -r {{app-dir}}/{{name}}.app /Applications/
+        cp -r {{macos-app-dir}}/{{name}}.app /Applications/
     fi
-
-install-migrations:
-  #!/usr/bin/env sh
-  set -ex
-  for file in ./migrations/*; do
-    install -Dm0644 $file "{{migrations_folder}}/$(basename "$file")"
-  done
 
 uninstall:
     #!/usr/bin/env sh
     if [ "$(uname)" = "Linux" ]; then
         rm {{bin-dst}} {{desktop-dst}}
-        for size in `ls {{icons-src}}`; do \
-            rm "{{icons-dst}}/$size/apps/{{appid}}.png"; \
-        done
+        find {{icons-src}} -type f -path "*/apps/*.svg" -exec bash -c '
+            for src; do
+                rel_path="${src#{{icons-src}}/}"
+                dst="{{icons-dst}}/$rel_path"
+                if [ -f "$dst" ]; then
+                    rm "$dst"
+                fi
+            done
+        ' bash {} +
     elif [ "$(uname)" = "Darwin" ]; then
         rm -rf /Applications/{{name}}.app
     fi

@@ -1,12 +1,13 @@
 [package]
 name = "cosmicding"
-version = "0.1.0"
+version = "2025.8.0"
 edition = "2021"
 
 [dependencies]
 anyhow = "1.0.89"
 chrono = "0.4.38"
 constcat = "0.5.1"
+cosmic-time = { git = "https://github.com/pop-os/cosmic-time.git", version = "0.4.0", features = ["once_cell"] }
 directories = "5.0.1"
 env_logger = "0.11.5"
 futures = "0.3.31"
@@ -17,34 +18,62 @@ log = "0.4.22"
 once_cell = "1.19.0"
 open = "5.3.0"
 paste = "1.0.15"
+pretty_env_logger = "0.5.0"
 reqwest = { version = "0.12.8", features = ["json"] }
 rust-embed = "8.5.0"
 serde = "1.0.210"
 serde_json = "1.0.128"
 sqlx = { version = "0.8.2", features = ["sqlite", "runtime-tokio", "chrono"] }
 tokio = { version = "1.40.0", features = ["full"] }
+urlencoding = "2.1.3"
 
 [dependencies.i18n-embed]
 version = "0.15"
 features = ["fluent-system", "desktop-requester"]
 
-[dependencies.libcosmic]
+[target.'cfg(target_os="macos")'.dependencies.libcosmic]
 git = "https://github.com/pop-os/libcosmic"
 default-features = false
-# features = ["dbus-config", "tokio", "winit", "wgpu"]
 features = [
+    # Native cosmic about drawer
+    "about",
+    # Accessibility support
     "a11y",
-    "dbus-config",
-    # NOTE: (vkhitrin) this is a temporary workaround to set initial
-    #       application title.
+    # Support creating additional application windows.
     "multi-window",
+    # On app startup, focuses an existing instance if the app is already open
     "single-instance",
+    # Uses tokio as the executor for the runtime
     "tokio",
+    # Windowing support for X11, Windows, Mac, & Redox
     "winit",
+    # GPU-accelerated rendering
     "wgpu",
 ]
-rev = "953685a88267894ea3fa40f2b99139c3c4e784d6"
-version = "0.1.0"
+
+[target.'cfg(target_os="linux")'.dependencies.libcosmic]
+git = "https://github.com/pop-os/libcosmic"
+default-features = false
+features = [
+    # Native cosmic about drawer
+    "about",
+    # Accessibility support
+    "a11y",
+    # Uses cosmic-settings-daemon to watch for config file changes
+    "dbus-config",
+    # Support creating additional application windows.
+    "multi-window",
+    # On app startup, focuses an existing instance if the app is already open
+    "single-instance",
+    # Uses tokio as the executor for the runtime
+    "tokio",
+    # Windowing support for X11, Windows, Mac, & Redox
+    "winit",
+    # Add Wayland support to winit
+    "wayland",
+    # GPU-accelerated rendering
+    "wgpu",
+]
 
 [build-dependencies]
 vergen = { version = "8", features = ["git", "gitcl"] }

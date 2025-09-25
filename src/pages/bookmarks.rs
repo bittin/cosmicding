@@ -1,63 +1,62 @@
-use crate::app::{ApplicationState, Message};
-use crate::fl;
-use crate::models::account::Account;
-use crate::models::bookmarks::Bookmark;
-use crate::style::disabled_link_button;
-use crate::utils::icons::load_icon;
+use crate::{
+    app::{
+        actions::{ApplicationAction, BookmarksAction},
+        ApplicationState, REFRESH_ICON,
+    },
+    fl,
+    models::{
+        account::Account, bookmarks::Bookmark, db_cursor::BookmarksPaginationCursor,
+        sync_status::SyncStatus,
+    },
+    style::{button::ButtonStyle, text_editor::text_editor_class},
+};
 use chrono::{DateTime, Local};
-use cosmic::iced::Length;
 use cosmic::{
-    app::command::Task,
-    iced::{self, Alignment},
+    app::Task,
+    cosmic_theme,
+    iced::{Alignment, Length},
+    iced_core::text,
+    style, theme,
     widget::{self},
     Apply, Element,
 };
-use cosmic::{cosmic_theme, theme};
-use iced::alignment::{Horizontal, Vertical};
+use cosmic_time::{anim, Timeline};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PageBookmarksView {
-    pub accounts: Vec<Account>,
-    pub bookmarks: Vec<Bookmark>,
-    account_placeholder: Option<Account>,
     bookmark_placeholder: Option<Bookmark>,
+    pub bookmarks: Vec<Bookmark>,
+    pub search_id: Option<widget::Id>,
     query_placeholder: String,
-}
-
-#[derive(Debug, Clone)]
-pub enum AppBookmarksMessage {
-    ClearSearch,
-    DeleteBookmark(Account, Bookmark),
-    EditBookmark(Account, Bookmark),
-    AddBookmark,
-    OpenAccountsPage,
-    OpenExternalURL(String),
-    RefreshBookmarks,
-    SearchBookmarks(String),
-    ViewNotes(Bookmark),
-    EmptyMessage,
 }
 
 impl PageBookmarksView {
     #[allow(clippy::too_many_lines)]
-    pub fn view(&self, app_state: ApplicationState) -> Element<'_, AppBookmarksMessage> {
+    pub fn view(
+        &self,
+        app_state: ApplicationState,
+        sync_status: SyncStatus,
+        bookmarks_cursor: &BookmarksPaginationCursor,
+        no_accounts: bool,
+        refresh_animation: &Timeline,
+    ) -> Element<'_, BookmarksAction> {
         let spacing = theme::active().cosmic().spacing;
-        if self.accounts.is_empty() {
+        if no_accounts {
             let container = widget::container(
                 widget::column::with_children(vec![
-                    widget::icon::icon(load_icon("web-browser-symbolic"))
+                    widget::icon::from_name("web-browser-symbolic")
                         .size(64)
                         .into(),
                     widget::text::title3(fl!("no-accounts")).into(),
                     widget::button::standard(fl!("open-accounts-page"))
-                        .on_press(AppBookmarksMessage::OpenAccountsPage)
+                        .on_press(BookmarksAction::OpenAccountsPage)
                         .into(),
                 ])
                 .spacing(20)
                 .align_x(Alignment::Center),
             )
-            .align_y(Vertical::Center)
-            .align_x(Horizontal::Center)
+            .align_y(Alignment::Center)
+            .align_x(Alignment::Center)
             .height(Length::Fill)
             .width(Length::Fill);
             widget::column::with_capacity(2)
@@ -65,19 +64,30 @@ impl PageBookmarksView {
                 .push(container)
                 .into()
         } else {
-            let mut items = widget::list::list_column()
+            let mut bookmarks = widget::list::list_column()
+                .style(style::Container::Background)
+                .list_item_padding(spacing.space_none)
+                .divider_padding(spacing.space_none)
                 .spacing(spacing.space_xxxs)
-                .padding([spacing.space_none, spacing.space_xxs]);
+                .padding(spacing.space_none);
 
-            for item in &self.bookmarks {
-                let derived_account = self
-                    .accounts
-                    .iter()
-                    .find(|&account| account.id == item.user_account_id)
-                    .unwrap();
+            for bookmark in &self.bookmarks {
+                let bookmark_account_id = bookmark.user_account_id.unwrap();
                 let date_added: DateTime<Local> =
-                    item.date_added.clone().unwrap().parse().expect("");
+                    bookmark.date_added.clone().unwrap().parse().expect("");
                 let mut columns = Vec::new();
+                let favicon_data = bookmark
+                    .favicon_cached
+                    .as_ref()
+                    .filter(|cached| !cached.favicon_data.is_empty())
+                    .map(|cached| cached.favicon_data.clone());
+                let favicon: widget::image::Handle = if let Some(data) = favicon_data {
+                    widget::image::Handle::from_bytes(data)
+                } else {
+                    let placeholder: &[u8] =
+                        include_bytes!("../../res/icons/favicon_placeholder.png");
+                    widget::image::Handle::from_bytes(placeholder)
+                };
                 // Mandatory first row - title
                 columns.push(
                     widget::row::with_capacity(2)
@@ -88,46 +98,45 @@ impl PageBookmarksView {
                             spacing.space_none,
                             spacing.space_xxxs,
                         ])
-                        .push(widget::icon::icon(load_icon("web-browser-symbolic")))
+                        .push(widget::image(favicon).width(16))
                         .push(
-                            widget::button::link(item.title.clone())
+                            widget::button::link(bookmark.title.clone())
                                 .spacing(spacing.space_xxxs)
                                 .trailing_icon(true)
                                 .icon_size(11)
-                                .tooltip(item.url.clone())
-                                .on_press(AppBookmarksMessage::OpenExternalURL(item.url.clone())),
+                                .tooltip(bookmark.url.clone())
+                                .on_press(BookmarksAction::OpenExternalURL(bookmark.url.clone())),
                         )
                         .align_y(Alignment::Center)
                         .into(),
                 );
                 // Optional second row - description
-                if !item.description.is_empty() {
+                if !bookmark.description.is_empty() {
                     columns.push(
                         widget::row::with_capacity(2)
                             .spacing(spacing.space_xs)
                             .padding([
                                 spacing.space_xxxs,
                                 spacing.space_xxs,
-                                if item.tag_names.is_empty() {
+                                if bookmark.tag_names.is_empty() {
                                     spacing.space_xxxs
                                 } else {
                                     spacing.space_none
                                 },
                                 spacing.space_xxxs,
                             ])
-                            .push(widget::icon::icon(load_icon("text-x-generic-symbolic")))
-                            .push(widget::text(item.description.clone()))
+                            .push(widget::text(bookmark.description.clone()))
                             .align_y(Alignment::Start)
                             .into(),
                     );
                 }
                 // Optional third row - tags
-                if !item.tag_names.is_empty() {
+                if !bookmark.tag_names.is_empty() {
                     columns.push(
                         widget::row::with_capacity(2)
                             .spacing(spacing.space_xs)
                             .padding([
-                                if item.description.is_empty() {
+                                if bookmark.description.is_empty() {
                                     spacing.space_xxxs
                                 } else {
                                     spacing.space_xxs
@@ -136,12 +145,10 @@ impl PageBookmarksView {
                                 spacing.space_xxxs,
                                 spacing.space_xxxs,
                             ])
-                            .push(widget::icon::icon(load_icon(
-                                "mail-mark-important-symbolic",
-                            )))
                             .push(
                                 widget::text::body(
-                                    item.tag_names
+                                    bookmark
+                                        .tag_names
                                         .iter()
                                         .map(|s| format!("#{s}"))
                                         .collect::<Vec<String>>()
@@ -157,32 +164,26 @@ impl PageBookmarksView {
                 let edit_bookmark_button = match app_state {
                     ApplicationState::Refreshing => widget::button::link(fl!("edit"))
                         .font_size(12)
-                        .class(disabled_link_button()),
+                        .class(ButtonStyle::DisabledLink(false).into()),
                     _ => widget::button::link(fl!("edit")).font_size(12).on_press(
-                        AppBookmarksMessage::EditBookmark(
-                            derived_account.to_owned(),
-                            item.to_owned(),
-                        ),
+                        BookmarksAction::EditBookmark(bookmark_account_id, bookmark.to_owned()),
                     ),
                 };
                 let remove_bookmark_button = match app_state {
                     ApplicationState::Refreshing => widget::button::link(fl!("remove"))
                         .font_size(12)
-                        .class(disabled_link_button()),
+                        .class(ButtonStyle::DisabledLink(false).into()),
                     _ => widget::button::link(fl!("remove")).font_size(12).on_press(
-                        AppBookmarksMessage::DeleteBookmark(
-                            derived_account.to_owned(),
-                            item.to_owned(),
-                        ),
+                        BookmarksAction::DeleteBookmark(bookmark_account_id, bookmark.to_owned()),
                     ),
                 };
                 let notes_button = match app_state {
                     ApplicationState::Refreshing => widget::button::link(fl!("notes"))
                         .font_size(12)
-                        .class(disabled_link_button()),
+                        .class(ButtonStyle::DisabledLink(false).into()),
                     _ => widget::button::link(fl!("notes"))
                         .font_size(12)
-                        .on_press(AppBookmarksMessage::ViewNotes(item.clone())),
+                        .on_press(BookmarksAction::ViewNotes(bookmark.clone())),
                 };
                 let snapshot_button = match app_state {
                     ApplicationState::Refreshing => widget::button::link(fl!("snapshot"))
@@ -190,26 +191,27 @@ impl PageBookmarksView {
                         .trailing_icon(true)
                         .font_size(12)
                         .icon_size(11)
-                        .tooltip(item.web_archive_snapshot_url.clone())
-                        .class(disabled_link_button()),
+                        .tooltip(bookmark.web_archive_snapshot_url.clone())
+                        .class(ButtonStyle::DisabledLink(false).into()),
                     _ => widget::button::link(fl!("snapshot"))
                         .spacing(spacing.space_xxxs)
                         .trailing_icon(true)
                         .font_size(12)
                         .icon_size(11)
-                        .tooltip(item.web_archive_snapshot_url.clone())
-                        .on_press(AppBookmarksMessage::OpenExternalURL(
-                            item.web_archive_snapshot_url.clone(),
+                        .tooltip(bookmark.web_archive_snapshot_url.clone())
+                        .on_press(BookmarksAction::OpenExternalURL(
+                            bookmark.web_archive_snapshot_url.clone(),
                         )),
                 };
-                let mut actions_row = widget::row::with_capacity(1)
-                    .spacing(spacing.space_xxs)
-                    .push(edit_bookmark_button)
-                    .push(remove_bookmark_button);
-                if !item.notes.is_empty() {
+                let mut actions_row = widget::row::with_capacity(1).spacing(spacing.space_xxs);
+                if bookmark.is_owner == Some(true) {
+                    actions_row = actions_row.push(edit_bookmark_button);
+                    actions_row = actions_row.push(remove_bookmark_button);
+                }
+                if !bookmark.notes.is_empty() {
                     actions_row = actions_row.push(notes_button);
                 }
-                if !item.web_archive_snapshot_url.is_empty() {
+                if !bookmark.web_archive_snapshot_url.is_empty() {
                     actions_row = actions_row.push(snapshot_button);
                 }
                 columns.push(
@@ -224,35 +226,32 @@ impl PageBookmarksView {
                 );
                 // Mandatory fifth row - details
                 let mut details_row = widget::row::with_capacity(1).spacing(spacing.space_xxs);
-                details_row = details_row
-                    .push(widget::icon::icon(load_icon("accessories-clock-symbolic")).size(12))
-                    .push(
-                        widget::text(date_added.format("%a, %d %b %Y %H:%M:%S").to_string())
-                            .size(12),
-                    );
-                if item.is_archived {
+                details_row = details_row.push(
+                    widget::text(date_added.format("%a, %d %b %Y %H:%M:%S").to_string()).size(12),
+                );
+                if bookmark.is_archived {
                     details_row = details_row
-                        .push(widget::icon::icon(load_icon("mail-archive-symbolic")).size(12))
+                        .push(widget::icon::from_name("mail-archive-symbolic").size(12))
                         .push(widget::text(fl!("archived")).size(12));
                 }
-                if item.unread {
+                if bookmark.unread {
                     details_row = details_row
-                        .push(
-                            widget::icon::icon(load_icon("x-office-spreadsheet-symbolic")).size(12),
-                        )
+                        .push(widget::icon::from_name("x-office-spreadsheet-symbolic").size(12))
                         .push(widget::text(fl!("unread")).size(12));
                 }
-                if item.shared {
+                if bookmark.shared {
                     details_row = details_row
-                        .push(widget::icon::icon(load_icon("emblem-shared-symbolic")).size(12))
-                        .push(widget::text(fl!("shared")).size(12));
+                        .push(widget::icon::from_name("emblem-shared-symbolic").size(12))
+                        .push(if bookmark.is_owner == Some(true) {
+                            widget::text(fl!("sharing")).size(12)
+                        } else {
+                            widget::text(fl!("shared")).size(12)
+                        });
                 }
                 columns.push(
                     details_row
                         .push(widget::horizontal_space())
-                        .push(widget::icon::icon(load_icon("user-available-symbolic")).size(12))
-                        .push(widget::text(derived_account.display_name.clone()).size(12))
-                        .align_y(iced::alignment::Vertical::Center)
+                        .align_y(Alignment::Center)
                         .spacing(spacing.space_xxs)
                         .padding([
                             spacing.space_xxxs,
@@ -263,9 +262,11 @@ impl PageBookmarksView {
                         .into(),
                 );
 
-                let bookmark_container = widget::container(widget::column::with_children(columns));
+                let bookmark_container = widget::container(widget::column::with_children(columns))
+                    .padding(spacing.space_none)
+                    .class(theme::Container::Background);
 
-                items = items.add(bookmark_container);
+                bookmarks = bookmarks.add(bookmark_container);
             }
 
             let refresh_button = if !self.query_placeholder.is_empty()
@@ -274,113 +275,219 @@ impl PageBookmarksView {
             {
                 widget::button::standard(fl!("refresh"))
             } else {
-                widget::button::standard(fl!("refresh"))
-                    .on_press(AppBookmarksMessage::RefreshBookmarks)
+                widget::button::standard(fl!("refresh")).on_press(BookmarksAction::RefreshBookmarks)
             };
-            let new_bookmark_button = match app_state {
-                ApplicationState::Normal => widget::button::standard(fl!("add-bookmark"))
-                    .on_press(AppBookmarksMessage::AddBookmark),
-                _ => widget::button::standard(fl!("add-bookmark")),
+            let mut new_bookmark_button = widget::button::standard(fl!("add-bookmark"));
+
+            let animation_widget = match app_state {
+                ApplicationState::Refreshing => anim![REFRESH_ICON, &refresh_animation, 16],
+                _ => match sync_status {
+                    SyncStatus::InProgress => anim![REFRESH_ICON, &refresh_animation, 16],
+                    SyncStatus::Warning => cosmic::widget::icon(
+                        widget::icon::from_name("dialog-warning-symbolic").handle(),
+                    )
+                    .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(
+                        move |theme: &cosmic::theme::Theme| {
+                            let cosmic = theme.cosmic();
+                            cosmic::iced_widget::svg::Style {
+                                color: Some(cosmic.warning.base.into()),
+                            }
+                        },
+                    )))
+                    .size(16),
+                    SyncStatus::Failed => widget::icon::from_name("dialog-error-symbolic")
+                        .size(16)
+                        .into(),
+                    SyncStatus::Successful => cosmic::widget::icon(
+                        widget::icon::from_name("checkbox-checked-symbolic").handle(),
+                    )
+                    .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(
+                        move |theme: &cosmic::theme::Theme| {
+                            let cosmic = theme.cosmic();
+                            cosmic::iced_widget::svg::Style {
+                                color: Some(cosmic.success.base.into()),
+                            }
+                        },
+                    )))
+                    .size(16),
+                    SyncStatus::None => cosmic::widget::icon(
+                        widget::icon::from_name("media-record-symbolic").handle(),
+                    )
+                    .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(
+                        move |theme: &cosmic::theme::Theme| {
+                            let cosmic = theme.cosmic();
+                            cosmic::iced_widget::svg::Style {
+                                color: Some(cosmic.background.base.into()),
+                            }
+                        },
+                    )))
+                    .size(16),
+                },
             };
+
+            let mut search_input_widget =
+                widget::text_input::search_input(fl!("search"), self.query_placeholder.clone())
+                    .id(self.search_id.clone().unwrap());
+
+            if matches!(app_state, ApplicationState::Ready) {
+                new_bookmark_button = new_bookmark_button.on_press(BookmarksAction::AddBookmark);
+            }
+            if !matches!(app_state, ApplicationState::NoEnabledAccounts) {
+                search_input_widget = search_input_widget
+                    .on_input(BookmarksAction::SearchBookmarks)
+                    .on_clear(BookmarksAction::ClearSearch);
+            }
 
             let bookmarks_widget = widget::column::with_capacity(1)
                 .spacing(spacing.space_xxs)
-                .push(items)
-                .apply(widget::container)
+                .push(bookmarks)
                 .height(Length::Shrink)
                 .apply(widget::scrollable)
                 .height(Length::Fill);
+
+            let navigation_previous_button = widget::button::standard(fl!("previous"))
+                .on_press_maybe(if bookmarks_cursor.current_page > 1 {
+                    Some(BookmarksAction::DecrementPageIndex)
+                } else {
+                    None
+                })
+                .leading_icon(widget::icon::from_name("go-previous-symbolic"));
+            let navigation_next_button = widget::button::standard(fl!("next"))
+                .on_press_maybe(
+                    if bookmarks_cursor.current_page < bookmarks_cursor.total_pages {
+                        Some(BookmarksAction::IncrementPageIndex)
+                    } else {
+                        None
+                    },
+                )
+                .trailing_icon(widget::icon::from_name("go-next-symbolic"));
+
+            let page_navigation_widget = widget::container(widget::column::with_children(vec![
+                widget::row::with_capacity(2)
+                    .align_y(Alignment::Center)
+                    .push(widget::horizontal_space())
+                    .push(navigation_previous_button)
+                    .push(widget::text::body(format!(
+                        "{}/{}",
+                        bookmarks_cursor.current_page, bookmarks_cursor.total_pages
+                    )))
+                    .spacing(spacing.space_xxs)
+                    .padding([
+                        spacing.space_xxs,
+                        spacing.space_none,
+                        spacing.space_xxs,
+                        spacing.space_none,
+                    ])
+                    .push(navigation_next_button)
+                    .push(widget::horizontal_space())
+                    .width(Length::Fill)
+                    .apply(widget::container)
+                    .into(),
+            ]));
 
             widget::container(
                 widget::column::with_children(vec![widget::row::with_capacity(2)
                     .align_y(Alignment::Center)
                     .push(widget::text::title3(fl!(
                         "bookmarks-with-count",
-                        count = self.bookmarks.len()
+                        count = bookmarks_cursor.total_entries
                     )))
                     .spacing(spacing.space_xxs)
                     .padding([
                         spacing.space_none,
                         spacing.space_none,
-                        spacing.space_s,
+                        spacing.space_xxs,
                         spacing.space_none,
                     ])
-                    .push(
-                        widget::search_input(fl!("search"), self.query_placeholder.clone())
-                            .on_input(AppBookmarksMessage::SearchBookmarks)
-                            .on_clear(AppBookmarksMessage::ClearSearch),
-                    )
+                    .push(animation_widget)
+                    .push(search_input_widget)
                     .push(refresh_button)
                     .push(new_bookmark_button)
                     .width(Length::Fill)
                     .apply(widget::container)
                     .into()])
-                .push(bookmarks_widget),
+                .push(bookmarks_widget)
+                .push(page_navigation_widget),
             )
             .into()
         }
     }
-    pub fn update(&mut self, message: AppBookmarksMessage) -> Task<Message> {
+    pub fn update(&mut self, message: BookmarksAction) -> Task<ApplicationAction> {
         let mut commands = Vec::new();
         match message {
-            AppBookmarksMessage::OpenAccountsPage => {
+            BookmarksAction::OpenAccountsPage => {
                 commands.push(Task::perform(async {}, |()| {
-                    cosmic::app::Message::App(Message::OpenAccountsPage)
+                    cosmic::Action::App(ApplicationAction::OpenAccountsPage)
                 }));
             }
-            AppBookmarksMessage::RefreshBookmarks => {
+            BookmarksAction::RefreshBookmarks => {
                 commands.push(Task::perform(async {}, |()| {
-                    cosmic::app::Message::App(Message::StartRefreshBookmarksForAllAccounts)
+                    cosmic::Action::App(ApplicationAction::StartRefreshBookmarksForAllAccounts)
                 }));
             }
-            AppBookmarksMessage::AddBookmark => {
+            BookmarksAction::AddBookmark => {
                 commands.push(Task::perform(async {}, |()| {
-                    cosmic::app::Message::App(Message::AddBookmarkForm)
+                    cosmic::Action::App(ApplicationAction::AddBookmarkForm)
                 }));
             }
-            AppBookmarksMessage::DeleteBookmark(account, bookmark) => {
+            BookmarksAction::DeleteBookmark(account_id, bookmark) => {
                 commands.push(Task::perform(async {}, move |()| {
-                    cosmic::app::Message::App(Message::OpenRemoveBookmarkDialog(
-                        account.clone(),
+                    cosmic::Action::App(ApplicationAction::OpenRemoveBookmarkDialog(
+                        account_id,
                         bookmark.clone(),
                     ))
                 }));
             }
-            AppBookmarksMessage::EditBookmark(account, bookmark) => {
-                self.account_placeholder = Some(account.clone());
+            BookmarksAction::EditBookmark(account_id, bookmark) => {
                 self.bookmark_placeholder = Some(bookmark.clone());
                 commands.push(Task::perform(async {}, move |()| {
-                    cosmic::app::Message::App(Message::EditBookmark(
-                        account.clone(),
+                    cosmic::Action::App(ApplicationAction::EditBookmarkForm(
+                        account_id,
                         bookmark.clone(),
                     ))
                 }));
             }
-            AppBookmarksMessage::SearchBookmarks(query) => {
+            BookmarksAction::SearchBookmarks(query) => {
                 self.query_placeholder.clone_from(&query);
                 commands.push(Task::perform(async {}, move |()| {
-                    cosmic::app::Message::App(Message::SearchBookmarks(query.clone()))
+                    cosmic::Action::App(ApplicationAction::SearchBookmarks(query.clone()))
                 }));
             }
-            AppBookmarksMessage::ClearSearch => {
-                self.query_placeholder = String::new();
-                commands.push(Task::perform(async {}, |()| {
-                    cosmic::app::Message::App(Message::LoadBookmarks)
-                }));
+            BookmarksAction::ClearSearch => {
+                if !self.query_placeholder.is_empty() {
+                    self.query_placeholder = String::new();
+                    commands.push(Task::perform(async {}, |()| {
+                        cosmic::Action::App(ApplicationAction::SearchBookmarks(String::new()))
+                    }));
+                }
             }
-            AppBookmarksMessage::OpenExternalURL(url) => {
+            BookmarksAction::OpenExternalURL(url) => {
                 commands.push(Task::perform(async {}, move |()| {
-                    cosmic::app::Message::App(Message::OpenExternalUrl(url.clone()))
+                    cosmic::Action::App(ApplicationAction::OpenExternalUrl(url.clone()))
                 }));
             }
-            AppBookmarksMessage::ViewNotes(bookmark) => {
+            BookmarksAction::ViewNotes(bookmark) => {
                 commands.push(Task::perform(async {}, move |()| {
-                    cosmic::app::Message::App(Message::ViewBookmarkNotes(bookmark.clone()))
+                    cosmic::Action::App(ApplicationAction::ViewBookmarkNotes(bookmark.clone()))
                 }));
             }
-            AppBookmarksMessage::EmptyMessage => {
+            BookmarksAction::EmptyMessage => {
                 commands.push(Task::perform(async {}, |()| {
-                    cosmic::app::Message::App(Message::Empty)
+                    cosmic::Action::App(ApplicationAction::Empty)
+                }));
+            }
+            BookmarksAction::IncrementPageIndex => {
+                commands.push(Task::perform(async {}, |()| {
+                    cosmic::Action::App(ApplicationAction::IncrementPageIndex(
+                        "bookmarks".to_string(),
+                    ))
+                }));
+            }
+            BookmarksAction::DecrementPageIndex => {
+                commands.push(Task::perform(async {}, |()| {
+                    cosmic::Action::App(ApplicationAction::DecrementPageIndex(
+                        "bookmarks".to_string(),
+                    ))
                 }));
             }
         }
@@ -391,9 +498,11 @@ impl PageBookmarksView {
 #[allow(clippy::too_many_lines)]
 pub fn new_bookmark<'a, 'b>(
     bookmark: Bookmark,
+    bookmark_notes: &'a widget::text_editor::Content,
+    bookmark_description: &'a widget::text_editor::Content,
     accounts: &'b [Account],
     selected_account_index: usize,
-) -> Element<'a, Message>
+) -> Element<'a, ApplicationAction>
 where
     'b: 'a,
 {
@@ -402,49 +511,69 @@ where
     let account_widget_title = widget::text::body(fl!("account"));
     let account_widget_dropdown =
         widget::dropdown(accounts, Some(selected_account_index), move |idx| {
-            Message::AddBookmarkFormAccountIndex(idx)
+            ApplicationAction::AddBookmarkFormAccountIndex(idx)
         });
     let url_widget_title = widget::text::body(fl!("url"));
     let url_widget_text_input =
-        widget::text_input("URL", bookmark.url.clone()).on_input(Message::SetBookmarkURL);
+        widget::text_input("URL", bookmark.url.clone()).on_input(ApplicationAction::SetBookmarkURL);
     let title_widget_title = widget::text::body(fl!("title"));
-    let title_widget_text_input =
-        widget::text_input("Title", bookmark.title.clone()).on_input(Message::SetBookmarkTitle);
+    let title_widget_text_input = widget::text_input("Title", bookmark.title.clone())
+        .on_input(ApplicationAction::SetBookmarkTitle);
     let description_widget_title = widget::text::body(fl!("description"));
-    let description_widget_text_input =
-        widget::text_input("Description", bookmark.description.clone())
-            .on_input(Message::SetBookmarkDescription);
+    let description_widget_text_editor = widget::text_editor(bookmark_description)
+        .height(120)
+        .padding(spacing.space_xxs)
+        .wrapping(text::Wrapping::WordOrGlyph)
+        .on_action(ApplicationAction::InputBookmarkDescription)
+        .class(cosmic::theme::iced::TextEditor::Custom(Box::new(
+            text_editor_class,
+        )));
     let notes_widget_title = widget::text::body(fl!("notes"));
-    let notes_widget_text_input = widget::text_input(fl!("notes"), bookmark.notes.clone())
-        .on_input(Message::SetBookmarkNotes);
+    let notes_widget_text_editor = widget::text_editor(bookmark_notes)
+        .height(120)
+        .padding(spacing.space_xxs)
+        .wrapping(text::Wrapping::WordOrGlyph)
+        .on_action(ApplicationAction::InputBookmarkNotes)
+        .class(cosmic::theme::iced::TextEditor::Custom(Box::new(
+            text_editor_class,
+        )));
     let tags_widget_title = widget::text::body(fl!("tags"));
     let tags_widget_subtext = widget::text::caption(fl!("tags-subtext"));
     let tags_widget_text_input = widget::text_input("Tags", bookmark.tag_names.join(" ").clone())
-        .on_input(Message::SetBookmarkTags);
-    let archived_widget_checkbox = widget::checkbox(fl!("archived"), bookmark.is_archived)
-        .on_toggle(Message::SetBookmarkArchived);
-    let unread_widget_checkbox =
-        widget::checkbox(fl!("unread"), bookmark.unread).on_toggle(Message::SetBookmarkUnread);
-    let shared_widget_checkbox = if accounts[selected_account_index].clone().enable_sharing {
-        widget::checkbox(fl!("shared"), bookmark.shared).on_toggle(Message::SetBookmarkShared)
-    } else {
-        widget::checkbox(fl!("shared-disabled"), false)
-    };
-    let buttons_widget_container = widget::container(
-        widget::button::standard(fl!("save")).on_press(Message::AddBookmark(
-            accounts[selected_account_index].clone(),
-            bookmark,
-        )),
-    )
-    .width(Length::Fill)
-    .align_x(iced::alignment::Horizontal::Center);
+        .on_input(ApplicationAction::SetBookmarkTags);
+    let archived_widget_toggler = widget::toggler(bookmark.is_archived)
+        .on_toggle(ApplicationAction::SetBookmarkArchived)
+        .spacing(10)
+        .label(fl!("archived"));
+    let unread_widget_toggler = widget::toggler(bookmark.unread)
+        .on_toggle(ApplicationAction::SetBookmarkUnread)
+        .spacing(10)
+        .label(fl!("unread"));
+    let shared_widget_toggler = widget::toggler(bookmark.shared)
+        .spacing(10)
+        .on_toggle_maybe(if accounts[selected_account_index].enable_sharing {
+            Some(ApplicationAction::SetBookmarkShared)
+        } else {
+            None
+        })
+        .label(if accounts[selected_account_index].enable_sharing {
+            fl!("shared")
+        } else {
+            fl!("shared-disabled")
+        });
+    let buttons_widget_container =
+        widget::container(widget::button::standard(fl!("save")).on_press(
+            ApplicationAction::StartAddBookmark(accounts[selected_account_index].clone(), bookmark),
+        ))
+        .width(Length::Fill)
+        .align_x(Alignment::Center);
 
     widget::column()
         .spacing(space_xxs)
         .push(
             widget::row::with_capacity(2)
                 .spacing(spacing.space_xxs)
-                .push(widget::icon::icon(load_icon("user-available-symbolic")))
+                .push(widget::icon::from_name("user-available-symbolic"))
                 .push(account_widget_title)
                 .padding([
                     spacing.space_none,
@@ -455,11 +584,10 @@ where
                 .align_y(Alignment::Center),
         )
         .push(account_widget_dropdown)
-        //.push(url_widget_title)
         .push(
             widget::row::with_capacity(2)
                 .spacing(spacing.space_xxs)
-                .push(widget::icon::icon(load_icon("web-browser-symbolic")))
+                .push(widget::icon::from_name("web-browser-symbolic"))
                 .push(url_widget_title)
                 .padding([
                     spacing.space_xxxs,
@@ -473,7 +601,7 @@ where
         .push(
             widget::row::with_capacity(2)
                 .spacing(spacing.space_xxs)
-                .push(widget::icon::icon(load_icon("insert-text-symbolic")))
+                .push(widget::icon::from_name("insert-text-symbolic"))
                 .push(title_widget_title)
                 .padding([
                     spacing.space_xxxs,
@@ -484,11 +612,10 @@ where
                 .align_y(Alignment::Center),
         )
         .push(title_widget_text_input)
-        //.push(description_widget_title)
         .push(
             widget::row::with_capacity(2)
                 .spacing(spacing.space_xxs)
-                .push(widget::icon::icon(load_icon("text-x-generic-symbolic")))
+                .push(widget::icon::from_name("text-x-generic-symbolic"))
                 .push(description_widget_title)
                 .padding([
                     spacing.space_xxxs,
@@ -498,11 +625,11 @@ where
                 ])
                 .align_y(Alignment::Start),
         )
-        .push(description_widget_text_input)
+        .push(description_widget_text_editor)
         .push(
             widget::row::with_capacity(2)
                 .spacing(spacing.space_xxs)
-                .push(widget::icon::icon(load_icon("x-office-document-symbolic")))
+                .push(widget::icon::from_name("x-office-document-symbolic"))
                 .push(notes_widget_title)
                 .padding([
                     spacing.space_xxxs,
@@ -512,13 +639,11 @@ where
                 ])
                 .align_y(Alignment::Center),
         )
-        .push(notes_widget_text_input)
+        .push(notes_widget_text_editor)
         .push(
             widget::row::with_capacity(2)
                 .spacing(spacing.space_xxs)
-                .push(widget::icon::icon(load_icon(
-                    "mail-mark-important-symbolic",
-                )))
+                .push(widget::icon::from_name("mail-mark-important-symbolic"))
                 .push(tags_widget_title)
                 .padding([
                     spacing.space_xxxs,
@@ -531,69 +656,90 @@ where
         .push(tags_widget_subtext)
         .push(tags_widget_text_input)
         .push(widget::Space::new(0, 5))
-        .push(archived_widget_checkbox)
-        .push(unread_widget_checkbox)
-        .push(shared_widget_checkbox)
+        .push(archived_widget_toggler)
+        .push(unread_widget_toggler)
+        .push(shared_widget_toggler)
         .push(widget::Space::new(0, 5))
         .push(buttons_widget_container)
         .into()
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn edit_bookmark<'a, 'b>(bookmark: Bookmark, accounts: &'b [Account]) -> Element<'a, Message>
+pub fn edit_bookmark<'a, 'b>(
+    bookmark: Bookmark,
+    bookmark_notes: &'a widget::text_editor::Content,
+    bookmark_description: &'a widget::text_editor::Content,
+    account: &'b Account,
+) -> Element<'a, ApplicationAction>
 where
     'b: 'a,
 {
     let spacing = theme::active().cosmic().spacing;
     let cosmic_theme::Spacing { space_xxs, .. } = theme::active().cosmic().spacing;
-    let account = accounts
-        .iter()
-        .find(|account| account.id == bookmark.user_account_id)
-        .cloned();
     let account_widget_title = widget::text::body(fl!("account"));
-    let account_widget_text_input = widget::text_input(
-        account.clone().unwrap().display_name,
-        account.clone().unwrap().display_name,
-    );
+    let account_widget_text_input =
+        widget::text_input(&account.display_name, &account.display_name);
     let url_widget_title = widget::text::body(fl!("url"));
     let url_widget_text_input =
-        widget::text_input("URL", bookmark.url.clone()).on_input(Message::SetBookmarkURL);
+        widget::text_input("URL", bookmark.url.clone()).on_input(ApplicationAction::SetBookmarkURL);
     let title_widget_title = widget::text::body(fl!("title"));
-    let title_widget_text_input =
-        widget::text_input("Title", bookmark.title.clone()).on_input(Message::SetBookmarkTitle);
+    let title_widget_text_input = widget::text_input("Title", bookmark.title.clone())
+        .on_input(ApplicationAction::SetBookmarkTitle);
     let description_widget_title = widget::text::body(fl!("description"));
-    let description_widget_text_input =
-        widget::text_input("Description", bookmark.description.clone())
-            .on_input(Message::SetBookmarkDescription);
+    let description_widget_text_editor = widget::text_editor(bookmark_description)
+        .height(120)
+        .padding(spacing.space_xxs)
+        .wrapping(text::Wrapping::WordOrGlyph)
+        .on_action(ApplicationAction::InputBookmarkDescription)
+        .class(cosmic::theme::iced::TextEditor::Custom(Box::new(
+            text_editor_class,
+        )));
     let notes_widget_title = widget::text::body(fl!("notes"));
-    let notes_widget_text_input = widget::text_input(fl!("notes"), bookmark.notes.clone())
-        .on_input(Message::SetBookmarkNotes);
+    let notes_widget_text_editor = widget::text_editor(bookmark_notes)
+        .height(120)
+        .padding(spacing.space_xxs)
+        .wrapping(text::Wrapping::WordOrGlyph)
+        .on_action(ApplicationAction::InputBookmarkNotes)
+        .class(cosmic::theme::iced::TextEditor::Custom(Box::new(
+            text_editor_class,
+        )));
     let tags_widget_title = widget::text::body(fl!("tags"));
     let tags_widget_subtext = widget::text::caption(fl!("tags-subtext"));
     let tags_widget_text_input = widget::text_input("Tags", bookmark.tag_names.join(" ").clone())
-        .on_input(Message::SetBookmarkTags);
-    let archived_widget_checkbox = widget::checkbox(fl!("archived"), bookmark.is_archived)
-        .on_toggle(Message::SetBookmarkArchived);
-    let unread_widget_checkbox =
-        widget::checkbox(fl!("unread"), bookmark.unread).on_toggle(Message::SetBookmarkUnread);
-    let shared_widget_checkbox = if account.clone().unwrap().enable_sharing {
-        widget::checkbox(fl!("shared"), bookmark.shared).on_toggle(Message::SetBookmarkShared)
-    } else {
-        widget::checkbox(fl!("shared-disabled"), false)
-    };
-    let buttons_widget_container = widget::container(
-        widget::button::standard(fl!("save"))
-            .on_press(Message::UpdateBookmark(account.unwrap(), bookmark)),
-    )
-    .width(Length::Fill)
-    .align_x(iced::alignment::Horizontal::Center);
+        .on_input(ApplicationAction::SetBookmarkTags);
+    let archived_widget_toggler = widget::toggler(bookmark.is_archived)
+        .on_toggle(ApplicationAction::SetBookmarkArchived)
+        .spacing(10)
+        .label(fl!("archived"));
+    let unread_widget_toggler = widget::toggler(bookmark.unread)
+        .on_toggle(ApplicationAction::SetBookmarkUnread)
+        .spacing(10)
+        .label(fl!("unread"));
+    let shared_widget_toggler = widget::toggler(bookmark.shared)
+        .spacing(10)
+        .on_toggle_maybe(if account.clone().enable_sharing {
+            Some(ApplicationAction::SetBookmarkShared)
+        } else {
+            None
+        })
+        .label(if account.clone().enable_sharing {
+            fl!("shared")
+        } else {
+            fl!("shared-disabled")
+        });
+    let buttons_widget_container =
+        widget::container(widget::button::standard(fl!("save")).on_press(
+            ApplicationAction::StartEditBookmark(account.clone(), bookmark),
+        ))
+        .width(Length::Fill)
+        .align_x(Alignment::Center);
 
     widget::column()
         .spacing(space_xxs)
         .push(
             widget::row::with_capacity(2)
                 .spacing(spacing.space_xxs)
-                .push(widget::icon::icon(load_icon("user-available-symbolic")))
+                .push(widget::icon::from_name("user-available-symbolic"))
                 .push(account_widget_title)
                 .padding([
                     spacing.space_none,
@@ -604,11 +750,10 @@ where
                 .align_y(Alignment::Center),
         )
         .push(account_widget_text_input)
-        //.push(url_widget_title)
         .push(
             widget::row::with_capacity(2)
                 .spacing(spacing.space_xxs)
-                .push(widget::icon::icon(load_icon("web-browser-symbolic")))
+                .push(widget::icon::from_name("web-browser-symbolic"))
                 .push(url_widget_title)
                 .padding([
                     spacing.space_xxxs,
@@ -622,7 +767,7 @@ where
         .push(
             widget::row::with_capacity(2)
                 .spacing(spacing.space_xxs)
-                .push(widget::icon::icon(load_icon("insert-text-symbolic")))
+                .push(widget::icon::from_name("insert-text-symbolic"))
                 .push(title_widget_title)
                 .padding([
                     spacing.space_xxxs,
@@ -633,11 +778,10 @@ where
                 .align_y(Alignment::Center),
         )
         .push(title_widget_text_input)
-        //.push(description_widget_title)
         .push(
             widget::row::with_capacity(2)
                 .spacing(spacing.space_xxs)
-                .push(widget::icon::icon(load_icon("text-x-generic-symbolic")))
+                .push(widget::icon::from_name("text-x-generic-symbolic"))
                 .push(description_widget_title)
                 .padding([
                     spacing.space_xxxs,
@@ -647,11 +791,11 @@ where
                 ])
                 .align_y(Alignment::Start),
         )
-        .push(description_widget_text_input)
+        .push(description_widget_text_editor)
         .push(
             widget::row::with_capacity(2)
                 .spacing(spacing.space_xxs)
-                .push(widget::icon::icon(load_icon("x-office-document-symbolic")))
+                .push(widget::icon::from_name("x-office-document-symbolic"))
                 .push(notes_widget_title)
                 .padding([
                     spacing.space_xxxs,
@@ -661,13 +805,11 @@ where
                 ])
                 .align_y(Alignment::Center),
         )
-        .push(notes_widget_text_input)
+        .push(notes_widget_text_editor)
         .push(
             widget::row::with_capacity(2)
                 .spacing(spacing.space_xxs)
-                .push(widget::icon::icon(load_icon(
-                    "mail-mark-important-symbolic",
-                )))
+                .push(widget::icon::from_name("mail-mark-important-symbolic"))
                 .push(tags_widget_title)
                 .padding([
                     spacing.space_xxxs,
@@ -680,19 +822,26 @@ where
         .push(tags_widget_subtext)
         .push(tags_widget_text_input)
         .push(widget::Space::new(0, 5))
-        .push(archived_widget_checkbox)
-        .push(unread_widget_checkbox)
-        .push(shared_widget_checkbox)
+        .push(archived_widget_toggler)
+        .push(unread_widget_toggler)
+        .push(shared_widget_toggler)
         .push(widget::Space::new(0, 5))
         .push(buttons_widget_container)
         .into()
 }
 
-pub fn view_notes<'a>(bookmark: Bookmark) -> Element<'a, Message> {
+pub fn view_notes(bookmark_notes: &widget::text_editor::Content) -> Element<ApplicationAction> {
+    let spacing = theme::active().cosmic().spacing;
     let cosmic_theme::Spacing { space_xxs, .. } = theme::active().cosmic().spacing;
+    let bookmark_notes_widget = widget::text_editor(bookmark_notes)
+        .padding(spacing.space_xxs)
+        .wrapping(text::Wrapping::WordOrGlyph)
+        .class(cosmic::theme::iced::TextEditor::Custom(Box::new(
+            text_editor_class,
+        )));
 
     widget::column()
         .spacing(space_xxs)
-        .push(widget::text::body(bookmark.notes))
+        .push(bookmark_notes_widget)
         .into()
 }
