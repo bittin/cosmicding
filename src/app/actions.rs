@@ -1,6 +1,7 @@
 use crate::models::{
     account::{Account, LinkdingAccountApiResponse},
     bookmarks::{Bookmark, BookmarkRemoveResponse, DetailedResponse},
+    provider::Provider,
 };
 use crate::{
     app::{
@@ -16,7 +17,7 @@ use cosmic::{
     widget::{self},
 };
 
-use std::time::Instant;
+use std::{path::PathBuf, time::Instant};
 
 #[derive(Debug, Clone)]
 pub enum ApplicationAction {
@@ -33,18 +34,34 @@ pub enum ApplicationAction {
     DialogCancel,
     DialogUpdate(DialogPage),
     DoneAddAccount(Account, Option<LinkdingAccountApiResponse>),
-    DoneAddBookmark(Account, Option<BookmarkCheckDetailsResponse>),
+    DoneAddBookmark(
+        Account,
+        Option<BookmarkCheckDetailsResponse>,
+        Option<ImportAction>,
+        Vec<(Bookmark, ImportAction)>,
+    ),
     DoneEditAccount(Account, Option<LinkdingAccountApiResponse>),
     DoneEditBookmark(Account, Option<BookmarkCheckDetailsResponse>),
     DoneFetchFaviconForBookmark(String, Bytes),
     DoneRefreshAccountProfile(Account, Option<LinkdingAccountApiResponse>),
-    DoneRefreshBookmarksForAccount(Account, Vec<DetailedResponse>),
-    DoneRefreshBookmarksForAllAccounts(Vec<DetailedResponse>),
+    DoneRefreshSingleAccount(DetailedResponse, Vec<Account>),
     DoneRemoveBookmark(Account, Bookmark, Option<BookmarkRemoveResponse>),
     EditAccountForm(Account),
     EditBookmarkForm(i64, Bookmark),
     Empty,
     EnableFavicons(bool),
+    ExportBookmarksSelectAccounts(Vec<bool>),
+    ImportBookmarksSelectAccount(usize),
+    StartExportBookmarks,
+    StartImportBookmarks,
+    SelectExportPath,
+    SelectImportPath,
+    SetExportPath(Option<PathBuf>),
+    SetImportPath(Option<PathBuf>),
+    PerformExportBookmarks(Vec<Account>),
+    PerformImportBookmarks(Account),
+    CancelImportBookmarks(u64),
+    DoneImportBookmarks(usize),
     IncrementPageIndex(String),
     InputBookmarkDescription(widget::text_editor::Action),
     InputBookmarkNotes(widget::text_editor::Action),
@@ -64,6 +81,7 @@ pub enum ApplicationAction {
     SetAccountAPIKey(String),
     SetAccountDisplayName(String),
     SetAccountInstance(String),
+    SetAccountProvider(Provider),
     SetAccountStatus(bool),
     SetAccountTrustInvalidCertificates(bool),
     SetBookmarkArchived(bool),
@@ -75,7 +93,12 @@ pub enum ApplicationAction {
     SetItemsPerPage(u8),
     SortOption(SortOption),
     StartAddAccount(Account),
-    StartAddBookmark(Account, Bookmark),
+    StartAddBookmark(
+        Account,
+        Bookmark,
+        Option<ImportAction>,
+        Vec<(Bookmark, ImportAction)>,
+    ),
     StartEditAccount(Account),
     StartEditBookmark(Account, Bookmark),
     StartFetchFaviconForBookmark(Bookmark),
@@ -94,17 +117,20 @@ pub enum ApplicationAction {
 #[derive(Debug, Clone)]
 pub enum AccountsAction {
     AddAccount,
+    CancelImport(u64),
     DecrementPageIndex,
     DeleteAccount(Account),
     EditAccount(Account),
     IncrementPageIndex,
     OpenExternalURL(String),
     RefreshBookmarksForAccount(Account),
+    ToggleAccountStatus(Account),
 }
 
 #[derive(Debug, Clone)]
 pub enum BookmarksAction {
     AddBookmark,
+    CancelImport(u64),
     ClearSearch,
     DecrementPageIndex,
     DeleteBookmark(i64, Bookmark),
@@ -116,4 +142,11 @@ pub enum BookmarksAction {
     RefreshBookmarks,
     SearchBookmarks(String),
     ViewNotes(Bookmark),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ImportAction {
+    pub import_id: u64,
+    pub total_count: usize,
+    pub current_index: usize,
 }

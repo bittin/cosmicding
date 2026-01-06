@@ -22,6 +22,8 @@ pub enum MenuAction {
     AddAccount,
     AddBookmark,
     Empty,
+    ExportBookmarks,
+    ImportBookmarks,
     RefreshBookmarks,
     SearchActivate,
     SetSortBookmarks(SortOption),
@@ -37,6 +39,8 @@ impl _MenuAction for MenuAction {
             MenuAction::AddAccount => ApplicationAction::AddAccountForm,
             MenuAction::AddBookmark => ApplicationAction::AddBookmarkForm,
             MenuAction::Empty => ApplicationAction::Empty,
+            MenuAction::ExportBookmarks => ApplicationAction::StartExportBookmarks,
+            MenuAction::ImportBookmarks => ApplicationAction::StartImportBookmarks,
             MenuAction::RefreshBookmarks => ApplicationAction::StartRefreshBookmarksForAllAccounts,
             // NOTE: (vkhitrin) this is a workaround for the time being, it shouldn't be a
             //                  'MenuAction'.
@@ -50,7 +54,6 @@ impl _MenuAction for MenuAction {
 #[allow(clippy::module_name_repetitions)]
 pub fn menu_bar<'a>(
     key_binds: &HashMap<KeyBind, MenuAction>,
-    accounts_present: bool,
     bookmarks_present: bool,
     sort_option: SortOption,
     app_state: ApplicationState,
@@ -61,11 +64,32 @@ pub fn menu_bar<'a>(
             menu::items(
                 key_binds,
                 vec![
-                    Item::Button(fl!("add-account"), None, MenuAction::AddAccount),
-                    if accounts_present && matches!(app_state, ApplicationState::Ready) {
+                    if matches!(
+                        app_state,
+                        ApplicationState::Ready | ApplicationState::NoEnabledRemoteAccounts
+                    ) {
+                        Item::Button(fl!("add-account"), None, MenuAction::AddAccount)
+                    } else {
+                        Item::ButtonDisabled(fl!("add-account"), None, MenuAction::AddAccount)
+                    },
+                    if matches!(
+                        app_state,
+                        ApplicationState::Ready | ApplicationState::NoEnabledRemoteAccounts
+                    ) {
                         Item::Button(fl!("add-bookmark"), None, MenuAction::AddBookmark)
                     } else {
                         Item::ButtonDisabled(fl!("add-bookmark"), None, MenuAction::AddBookmark)
+                    },
+                    Item::Divider,
+                    if bookmarks_present && matches!(app_state, ApplicationState::Ready) {
+                        Item::Button(fl!("export-bookmarks"), None, MenuAction::ExportBookmarks)
+                    } else {
+                        Item::ButtonDisabled(fl!("export-bookmarks"), None, MenuAction::Empty)
+                    },
+                    if matches!(app_state, ApplicationState::Ready) {
+                        Item::Button(fl!("import-bookmarks"), None, MenuAction::ImportBookmarks)
+                    } else {
+                        Item::ButtonDisabled(fl!("import-bookmarks"), None, MenuAction::Empty)
                     },
                     Item::Divider,
                     if bookmarks_present && matches!(app_state, ApplicationState::Ready) {

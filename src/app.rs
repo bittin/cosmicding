@@ -1,6 +1,6 @@
 use crate::{
     app::{
-        actions::ApplicationAction,
+        actions::{ApplicationAction, ImportAction},
         config::{AppTheme, CosmicConfig, SortOption},
         context::ContextPage,
         dialog::DialogPage,
@@ -9,7 +9,6 @@ use crate::{
     },
     db::{self},
     fl,
-    http::{self},
     models::{
         account::{Account, LinkdingAccountApiResponse},
         bookmarks::{
@@ -17,13 +16,17 @@ use crate::{
         },
         db_cursor::{AccountsPaginationCursor, BookmarksPaginationCursor, Pagination},
         favicon_cache::Favicon,
+        operation::OperationProgress,
+        provider::Provider,
         sync_status::SyncStatus,
     },
     pages::{
         accounts::{add_account, edit_account, PageAccountsView},
         bookmarks::{edit_bookmark, new_bookmark, view_notes, PageBookmarksView},
     },
+    provider::{self},
     style::animation::refresh,
+    utils::bookmark_parser,
 };
 use cosmic::{
     app::{context_drawer, Core, Task},
@@ -37,6 +40,7 @@ use cosmic::{
     },
     iced_core::image::Bytes,
     iced_widget::tooltip,
+    theme,
     widget::{
         self,
         about::About,
@@ -51,6 +55,7 @@ use key_bind::key_binds;
 use std::{
     any::TypeId,
     collections::{HashMap, VecDeque},
+    path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -72,6 +77,27 @@ const REPOSITORY: &str = "https://github.com/vkhitrin/cosmicding";
 pub static REFRESH_ICON: std::sync::LazyLock<refresh::Id> =
     std::sync::LazyLock::new(refresh::Id::unique);
 
+async fn open_save_file_dialog(default_name: &str) -> Option<PathBuf> {
+    use rfd::AsyncFileDialog;
+
+    AsyncFileDialog::new()
+        .set_file_name(default_name)
+        .add_filter("HTML Files", &["html"])
+        .save_file()
+        .await
+        .map(|file| file.path().to_path_buf())
+}
+
+async fn open_file_dialog() -> Option<PathBuf> {
+    use rfd::AsyncFileDialog;
+
+    AsyncFileDialog::new()
+        .add_filter("HTML Files", &["html"])
+        .pick_file()
+        .await
+        .map(|file| file.path().to_path_buf())
+}
+
 pub struct Flags {
     pub config_handler: Option<cosmic_config::Config>,
     pub config: CosmicConfig,
@@ -87,12 +113,12 @@ pub struct Cosmicding {
     key_binds: HashMap<KeyBind, menu::MenuAction>,
     modifiers: Modifiers,
     nav: nav_bar::Model,
-    placeholder_account: Option<Account>,
-    placeholder_accounts_list: Vec<Account>,
-    placeholder_bookmark: Option<Bookmark>,
-    placeholder_bookmark_description: widget::text_editor::Content,
-    placeholder_bookmark_notes: widget::text_editor::Content,
-    placeholder_selected_account_index: usize,
+    context_account: Option<Account>,
+    context_accounts_list: Vec<Account>,
+    context_bookmark: Option<Bookmark>,
+    context_bookmark_description: widget::text_editor::Content,
+    context_bookmark_notes: widget::text_editor::Content,
+    context_selected_account_index: usize,
     pub accounts_cursor: AccountsPaginationCursor,
     pub accounts_view: PageAccountsView,
     pub bookmarks_cursor: BookmarksPaginationCursor,
@@ -103,12 +129,13 @@ pub struct Cosmicding {
     timeline: Timeline,
     sync_status: SyncStatus,
     toasts: widget::toaster::Toasts<ApplicationAction>,
+    operation_progress: Option<OperationProgress>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum ApplicationState {
     Loading,
-    NoEnabledAccounts,
+    NoEnabledRemoteAccounts,
     Ready,
     Refreshing,
 }
@@ -192,17 +219,18 @@ impl Application for Cosmicding {
             key_binds: key_binds(),
             modifiers: Modifiers::empty(),
             nav,
-            placeholder_account: None,
-            placeholder_accounts_list: Vec::new(),
-            placeholder_bookmark: None,
-            placeholder_bookmark_description: widget::text_editor::Content::new(),
-            placeholder_bookmark_notes: widget::text_editor::Content::new(),
-            placeholder_selected_account_index: 0,
-            state: ApplicationState::NoEnabledAccounts,
+            context_account: None,
+            context_accounts_list: Vec::new(),
+            context_bookmark: None,
+            context_bookmark_description: widget::text_editor::Content::new(),
+            context_bookmark_notes: widget::text_editor::Content::new(),
+            context_selected_account_index: 0,
+            state: ApplicationState::NoEnabledRemoteAccounts,
             search_id: widget::Id::unique(),
             timeline,
             sync_status: SyncStatus::default(),
             toasts: widget::toaster::Toasts::new(ApplicationAction::CloseToast),
+            operation_progress: None,
         };
 
         app.bookmarks_cursor.items_per_page = app.config.items_per_page;
@@ -226,10 +254,9 @@ impl Application for Cosmicding {
         (app, Task::batch(commands))
     }
 
-    fn header_start(&self) -> Vec<Element<Self::Message>> {
+    fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
         vec![app_menu::menu_bar(
             &self.key_binds,
-            !self.accounts_view.accounts.is_empty(),
             !self.bookmarks_view.bookmarks.is_empty(),
             self.config.sort_option,
             self.state,
@@ -249,7 +276,7 @@ impl Application for Cosmicding {
         Task::none()
     }
 
-    fn context_drawer(&self) -> Option<context_drawer::ContextDrawer<ApplicationAction>> {
+    fn context_drawer(&self) -> Option<context_drawer::ContextDrawer<'_, ApplicationAction>> {
         if !self.core.window.show_context {
             return None;
         }
@@ -257,7 +284,7 @@ impl Application for Cosmicding {
             ContextPage::About => Some(
                 context_drawer::about(
                     &self.about,
-                    ApplicationAction::OpenExternalUrl,
+                    |url| ApplicationAction::OpenExternalUrl(url.to_string()),
                     ApplicationAction::ContextClose,
                 )
                 .title(self.context_page.title()),
@@ -268,14 +295,14 @@ impl Application for Cosmicding {
             ),
             ContextPage::AddAccountForm => Some(
                 context_drawer::context_drawer(
-                    add_account(self.placeholder_account.clone().unwrap()),
+                    add_account(self.context_account.clone().unwrap()),
                     ApplicationAction::ContextClose,
                 )
                 .title(self.context_page.title()),
             ),
             ContextPage::EditAccountForm => Some(
                 context_drawer::context_drawer(
-                    edit_account(self.placeholder_account.clone().unwrap()),
+                    edit_account(self.context_account.clone().unwrap()),
                     ApplicationAction::ContextClose,
                 )
                 .title(self.context_page.title()),
@@ -283,11 +310,11 @@ impl Application for Cosmicding {
             ContextPage::NewBookmarkForm => Some(
                 context_drawer::context_drawer(
                     new_bookmark(
-                        self.placeholder_bookmark.clone().unwrap(),
-                        &self.placeholder_bookmark_notes,
-                        &self.placeholder_bookmark_description,
-                        &self.placeholder_accounts_list,
-                        self.placeholder_selected_account_index,
+                        self.context_bookmark.clone().unwrap(),
+                        &self.context_bookmark_notes,
+                        &self.context_bookmark_description,
+                        &self.context_accounts_list,
+                        self.context_selected_account_index,
                     ),
                     ApplicationAction::ContextClose,
                 )
@@ -296,10 +323,10 @@ impl Application for Cosmicding {
             ContextPage::EditBookmarkForm => Some(
                 context_drawer::context_drawer(
                     edit_bookmark(
-                        self.placeholder_bookmark.clone().unwrap(),
-                        &self.placeholder_bookmark_notes,
-                        &self.placeholder_bookmark_description,
-                        self.placeholder_account.as_ref().unwrap(),
+                        self.context_bookmark.clone().unwrap(),
+                        &self.context_bookmark_notes,
+                        &self.context_bookmark_description,
+                        self.context_account.as_ref().unwrap(),
                     ),
                     ApplicationAction::ContextClose,
                 )
@@ -307,7 +334,7 @@ impl Application for Cosmicding {
             ),
             ContextPage::ViewBookmarkNotes => Some(
                 context_drawer::context_drawer(
-                    view_notes(&self.placeholder_bookmark_notes),
+                    view_notes(&self.context_bookmark_notes),
                     ApplicationAction::ContextClose,
                 )
                 .title(self.context_page.title()),
@@ -315,7 +342,7 @@ impl Application for Cosmicding {
         }
     }
 
-    fn dialog(&self) -> Option<Element<ApplicationAction>> {
+    fn dialog(&self) -> Option<Element<'_, ApplicationAction>> {
         let dialog_page = self.dialog_pages.front()?;
 
         let dialog = match dialog_page {
@@ -353,12 +380,172 @@ impl Application for Cosmicding {
                     widget::button::standard(fl!("cancel"))
                         .on_press(ApplicationAction::DialogCancel),
                 ),
+            DialogPage::ExportBookmarks(accounts, selected, path) => {
+                let spacing = cosmic::theme::active().cosmic().spacing;
+                let mut body_column = widget::column::with_capacity(3).spacing(spacing.space_s);
+
+                body_column = body_column.push(widget::text::body(fl!("export-bookmarks-body")));
+
+                let mut accounts_list =
+                    widget::column::with_capacity(accounts.len()).spacing(spacing.space_xxs);
+
+                for (idx, account) in accounts.iter().enumerate() {
+                    let is_selected = selected.get(idx).copied().unwrap_or(false);
+                    let checkbox = widget::checkbox(&account.display_name, is_selected).on_toggle(
+                        move |checked| {
+                            let mut new_selected = selected.clone();
+                            if idx < new_selected.len() {
+                                new_selected[idx] = checked;
+                            }
+                            ApplicationAction::ExportBookmarksSelectAccounts(new_selected)
+                        },
+                    );
+                    accounts_list = accounts_list.push(checkbox);
+                }
+
+                let accounts_container = widget::container(
+                    widget::container(accounts_list)
+                        .padding([spacing.space_xs, spacing.space_s])
+                        .width(Length::Fill),
+                )
+                .padding([spacing.space_xxs, 0])
+                .width(Length::Fill)
+                .class(theme::Container::Background);
+
+                body_column = body_column.push(
+                    widget::column::with_capacity(2)
+                        .spacing(spacing.space_xxs)
+                        .push(widget::text::caption(fl!("select-accounts")))
+                        .push(accounts_container),
+                );
+
+                let path_container = widget::container(
+                    widget::row::with_capacity(2)
+                        .spacing(spacing.space_xs)
+                        .align_y(cosmic::iced::Alignment::Center)
+                        .push(
+                            widget::container(widget::text::body(if let Some(p) = path {
+                                p.to_string_lossy().to_string()
+                            } else {
+                                fl!("no-file-selected")
+                            }))
+                            .width(Length::Fill)
+                            .padding([spacing.space_xxs, spacing.space_xs])
+                            .class(theme::Container::Background),
+                        )
+                        .push(
+                            widget::button::standard(fl!("browse"))
+                                .on_press(ApplicationAction::SelectExportPath),
+                        ),
+                )
+                .width(Length::Fill);
+
+                body_column = body_column.push(path_container);
+
+                let has_selection = selected.iter().any(|&s| s);
+                let has_path = path.is_some();
+                let selected_accounts: Vec<Account> = accounts
+                    .iter()
+                    .zip(selected.iter())
+                    .filter(|(_, &sel)| sel)
+                    .map(|(acc, _)| acc.clone())
+                    .collect();
+
+                widget::dialog()
+                    .title(fl!("export-bookmarks"))
+                    .icon(icon::from_name("document-save-symbolic").size(58))
+                    .control(body_column)
+                    .primary_action(if has_selection && has_path {
+                        widget::button::suggested(fl!("export"))
+                            .on_press(ApplicationAction::PerformExportBookmarks(selected_accounts))
+                    } else {
+                        widget::button::suggested(fl!("export"))
+                    })
+                    .secondary_action(
+                        widget::button::standard(fl!("cancel"))
+                            .on_press(ApplicationAction::DialogCancel),
+                    )
+            }
+            DialogPage::ImportBookmarks(accounts, selected_idx, path) => {
+                let spacing = cosmic::theme::active().cosmic().spacing;
+                let mut body_column = widget::column::with_capacity(3).spacing(spacing.space_s);
+
+                body_column = body_column.push(widget::text::body(fl!("import-bookmarks-body")));
+
+                let account_dropdown = widget::row::with_capacity(2)
+                    .spacing(spacing.space_xs)
+                    .align_y(cosmic::iced::Alignment::Center)
+                    .push(
+                        widget::container(widget::text::body(fl!("account")))
+                            .padding([spacing.space_xxs, spacing.space_xs])
+                            .align_y(cosmic::iced::alignment::Vertical::Center)
+                            .height(Length::Shrink),
+                    )
+                    .push({
+                        let account_names: Vec<String> = accounts
+                            .iter()
+                            .map(|acc| acc.display_name.clone())
+                            .collect();
+                        widget::container(
+                            widget::dropdown(account_names, Some(*selected_idx), move |idx| {
+                                ApplicationAction::ImportBookmarksSelectAccount(idx)
+                            })
+                            .width(Length::Fixed(150.0)),
+                        )
+                        .class(theme::Container::Background)
+                    });
+
+                body_column = body_column.push(account_dropdown);
+
+                let path_container = widget::container(
+                    widget::row::with_capacity(2)
+                        .spacing(spacing.space_xs)
+                        .align_y(cosmic::iced::Alignment::Center)
+                        .push(
+                            widget::container(widget::text::body(if let Some(p) = path {
+                                p.to_string_lossy().to_string()
+                            } else {
+                                fl!("no-file-selected")
+                            }))
+                            .width(Length::Fill)
+                            .padding([spacing.space_xxs, spacing.space_xs])
+                            .class(theme::Container::Background),
+                        )
+                        .push(
+                            widget::button::standard(fl!("browse"))
+                                .on_press(ApplicationAction::SelectImportPath),
+                        ),
+                )
+                .width(Length::Fill);
+
+                body_column = body_column.push(path_container);
+
+                let has_path = path.is_some();
+
+                widget::dialog()
+                    .title(fl!("import-bookmarks"))
+                    .icon(icon::from_name("document-open-symbolic").size(58))
+                    .control(body_column)
+                    .primary_action(if has_path {
+                        widget::button::suggested(fl!("import")).on_press(
+                            ApplicationAction::PerformImportBookmarks(
+                                accounts[*selected_idx].clone(),
+                            ),
+                        )
+                    } else {
+                        widget::button::suggested(fl!("import"))
+                    })
+                    .secondary_action(
+                        widget::button::standard(fl!("cancel"))
+                            .on_press(ApplicationAction::DialogCancel),
+                    )
+            }
         };
 
         Some(dialog.into())
     }
 
-    fn view(&self) -> Element<Self::Message> {
+    fn view(&self) -> Element<'_, Self::Message> {
         let spacing = cosmic::theme::active().cosmic().spacing;
         let entity = self.nav.active();
         let nav_page = self.nav.data::<AppNavPage>(entity).unwrap_or_default();
@@ -500,28 +687,73 @@ impl Application for Cosmicding {
                     self.accounts_cursor.refresh_count().await;
                 });
                 self.accounts_view.accounts = self.accounts_cursor.result.clone().unwrap();
+
+                self.context_accounts_list = block_on(async {
+                    db::SqliteDatabase::select_accounts(
+                        self.bookmarks_cursor.database.as_mut().unwrap(),
+                    )
+                    .await
+                });
+
+                if self.context_selected_account_index >= self.context_accounts_list.len() {
+                    self.context_selected_account_index = if self.context_accounts_list.is_empty() {
+                        0
+                    } else {
+                        self.context_accounts_list.len() - 1
+                    };
+                }
+
+                // NOTE: (vkhitrin) For future reference if we need to perform some validations for
+                //       local provider.
+                if let Some(ref mut database) = &mut self.accounts_cursor.database {
+                    for account in &mut self.accounts_view.accounts {
+                        if account.is_local_provider() {
+                            let current_version =
+                                provider::get_provider_version(account.provider(), None);
+                            if account.provider_version != current_version {
+                                account.provider_version = current_version;
+                                let account_clone = account.clone();
+                                block_on(async {
+                                    db::SqliteDatabase::update_account(database, &account_clone)
+                                        .await;
+                                });
+                            }
+                        }
+                    }
+                }
+
+                self.accounts_view
+                    .accounts
+                    .sort_by_key(|account| match account.provider() {
+                        Provider::Cosmicding => 0,
+                        Provider::Linkding => 1,
+                    });
                 // FIXME: (vkhitrin) If an account is deleted during refresh (should not be
                 //        possible without interacting with the database manually, a crash will
                 //        occur if an account context window is open.
-                if self.placeholder_account.is_some() && !self.accounts_view.accounts.is_empty() {
-                    self.placeholder_account = self
+                if self.context_account.is_some() && !self.accounts_view.accounts.is_empty() {
+                    self.context_account = self
                         .accounts_view
                         .accounts
                         .clone()
                         .iter()
-                        .find(|account| account.id == self.placeholder_account.as_ref().unwrap().id)
+                        .find(|account| account.id == self.context_account.as_ref().unwrap().id)
                         .cloned();
                 }
             }
             ApplicationAction::AddAccountForm => {
-                self.placeholder_account =
-                    Some(Account::new(String::new(), String::new(), String::new()));
+                self.context_account = Some(Account::new(
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    Provider::Linkding,
+                ));
                 commands.push(self.update(ApplicationAction::ToggleContextPage(
                     ContextPage::AddAccountForm,
                 )));
             }
             ApplicationAction::EditAccountForm(account) => {
-                self.placeholder_account = Some(account.clone());
+                self.context_account = Some(account.clone());
                 commands.push(self.update(ApplicationAction::ToggleContextPage(
                     ContextPage::EditAccountForm,
                 )));
@@ -561,6 +793,12 @@ impl Application for Cosmicding {
                         self.accounts_cursor.fetch_next_results().await;
                     });
                     self.accounts_view.accounts = self.accounts_cursor.result.clone().unwrap();
+                    self.accounts_view
+                        .accounts
+                        .sort_by_key(|account| match account.provider() {
+                            Provider::Cosmicding => 0,
+                            Provider::Linkding => 1,
+                        });
                     commands.push(self.update(ApplicationAction::LoadBookmarks));
                 }
             }
@@ -588,13 +826,19 @@ impl Application for Cosmicding {
                                 api_response,
                             ))
                         };
-                        commands.push(Task::perform(http::fetch_account_details(account), message));
+                        commands.push(Task::perform(
+                            provider::fetch_account_details(account),
+                            message,
+                        ));
                     }
                 }
             }
-            ApplicationAction::DoneAddAccount(account, api_response) => {
+            ApplicationAction::DoneAddAccount(mut account, api_response) => {
                 if let Some(response) = api_response {
                     if response.error.is_none() {
+                        account.provider_version =
+                            provider::get_provider_version(account.provider(), Some(&response));
+
                         if let Some(ref mut database) = &mut self.accounts_cursor.database {
                             block_on(async {
                                 db::SqliteDatabase::create_account(database, &account).await;
@@ -637,7 +881,10 @@ impl Application for Cosmicding {
                             api_response,
                         ))
                     };
-                    commands.push(Task::perform(http::fetch_account_details(account), message));
+                    commands.push(Task::perform(
+                        provider::fetch_account_details(account),
+                        message,
+                    ));
                 } else {
                     commands.push(self.update(ApplicationAction::DoneEditAccount(account, None)));
                 }
@@ -654,6 +901,8 @@ impl Application for Cosmicding {
                         if response.error.is_none() {
                             account.enable_public_sharing = response.enable_public_sharing;
                             account.enable_sharing = response.enable_sharing;
+                            account.provider_version =
+                                provider::get_provider_version(account.provider(), Some(&response));
                             if current_account != account {
                                 block_on(async {
                                     db::SqliteDatabase::update_account(database, &account).await;
@@ -686,22 +935,29 @@ impl Application for Cosmicding {
                                     .map(cosmic::Action::App),
                             );
                         }
-                    } else if current_account != account {
-                        block_on(async {
-                            db::SqliteDatabase::update_account(database, &account).await;
-                        });
-                        commands.push(
-                            self.toasts
-                                .push(widget::toaster::Toast::new(fl!(
-                                    "disabled-account",
-                                    acc = account_clone.display_name
-                                )))
-                                .map(cosmic::Action::App),
-                        );
-                        commands.push(self.update(ApplicationAction::LoadAccounts));
-                        commands.push(self.update(
-                            ApplicationAction::StartRefreshBookmarksForAccount(account.clone()),
-                        ));
+                    } else {
+                        if account.is_local_provider() {
+                            account.provider_version =
+                                provider::get_provider_version(account.provider(), None);
+                        }
+
+                        if current_account != account {
+                            block_on(async {
+                                db::SqliteDatabase::update_account(database, &account).await;
+                            });
+                            commands.push(
+                                self.toasts
+                                    .push(widget::toaster::Toast::new(fl!(
+                                        "disabled-account",
+                                        acc = account_clone.display_name
+                                    )))
+                                    .map(cosmic::Action::App),
+                            );
+                            commands.push(self.update(ApplicationAction::LoadAccounts));
+                            commands.push(self.update(
+                                ApplicationAction::StartRefreshBookmarksForAccount(account.clone()),
+                            ));
+                        }
                     }
                 }
             }
@@ -712,149 +968,140 @@ impl Application for Cosmicding {
                 if !self.accounts_view.accounts.is_empty() {
                     if let ApplicationState::Refreshing = self.state {
                     } else {
-                        // NOTE: (vkhitrin) if all accounts disabled, do not attempt to refresh
-                        if self.accounts_view.accounts.iter().all(|item| !item.enabled) {
-                            self.state = ApplicationState::NoEnabledAccounts;
+                        let enabled_accounts: Vec<Account> = self
+                            .accounts_view
+                            .accounts
+                            .iter()
+                            .filter(|a| a.enabled && !a.is_local_provider())
+                            .cloned()
+                            .collect();
+
+                        if enabled_accounts.is_empty() {
+                            self.state = ApplicationState::NoEnabledRemoteAccounts;
+                            commands.push(self.update(ApplicationAction::LoadBookmarks));
                         } else {
                             self.state = ApplicationState::Refreshing;
-                            let message = |x: Vec<DetailedResponse>| {
-                                cosmic::Action::App(
-                                    ApplicationAction::DoneRefreshBookmarksForAllAccounts(x),
-                                )
+                            let total_accounts = enabled_accounts.len();
+                            self.operation_progress = Some(OperationProgress {
+                                operation_id: 0,
+                                total: total_accounts,
+                                current: 0,
+                                operation_label: fl!("refreshing-accounts"),
+                                cancellable: false,
+                            });
+
+                            let first_account = enabled_accounts[0].clone();
+                            let remaining_accounts = enabled_accounts[1..].to_vec();
+
+                            let message = move |response: DetailedResponse| {
+                                cosmic::Action::App(ApplicationAction::DoneRefreshSingleAccount(
+                                    response,
+                                    remaining_accounts.clone(),
+                                ))
                             };
-                            if !self.accounts_view.accounts.is_empty() {
-                                commands.push(Task::perform(
-                                    http::fetch_bookmarks_from_all_accounts(
-                                        self.accounts_view.accounts.clone(),
-                                    ),
-                                    message,
-                                ));
-                            }
+
+                            commands.push(Task::perform(
+                                provider::fetch_bookmarks_for_single_account(first_account),
+                                message,
+                            ));
                         }
                     }
                 }
             }
-            ApplicationAction::DoneRefreshBookmarksForAllAccounts(remote_responses) => {
-                let mut failed_accounts: Vec<String> = Vec::new();
+            ApplicationAction::DoneRefreshSingleAccount(response, remaining_accounts) => {
                 if let Some(ref mut database) = &mut self.bookmarks_cursor.database {
-                    for response in remote_responses.iter().cloned() {
-                        if !response.successful {
-                            failed_accounts.push(response.account.display_name.clone());
-                        }
-                        block_on(async {
-                            db::SqliteDatabase::aggregate_bookmarks_for_account(
-                                database,
-                                &response.account,
-                                response.bookmarks.unwrap_or_else(Vec::new),
-                                response.timestamp,
-                                response.successful,
-                            )
-                            .await;
-                        });
+                    if !response.successful {
+                        log::error!(
+                            "Failed to refresh account: {}",
+                            response.account.display_name
+                        );
                     }
-                    commands.push(self.update(ApplicationAction::LoadAccounts));
-                    commands.push(self.update(ApplicationAction::LoadBookmarks));
-                    self.state = ApplicationState::Ready;
-                    if failed_accounts.is_empty() {
+                    block_on(async {
+                        db::SqliteDatabase::aggregate_bookmarks_for_account(
+                            database,
+                            &response.account,
+                            response.bookmarks.unwrap_or_else(Vec::new),
+                            response.timestamp,
+                            response.successful,
+                        )
+                        .await;
+                    });
+                }
+
+                if let Some(ref mut progress) = self.operation_progress {
+                    progress.current += 1;
+
+                    if remaining_accounts.is_empty() {
+                        self.operation_progress = None;
+                        commands.push(self.update(ApplicationAction::LoadAccounts));
+                        commands.push(self.update(ApplicationAction::LoadBookmarks));
+                        self.state = ApplicationState::Ready;
                         self.sync_status = SyncStatus::Successful;
                         commands.push(
                             self.toasts
                                 .push(widget::toaster::Toast::new(fl!("refreshed-bookmarks")))
                                 .map(cosmic::Action::App),
                         );
-                    } else if remote_responses.len() == failed_accounts.len() {
-                        self.sync_status = SyncStatus::Failed;
-                        commands.push(
-                            self.toasts
-                                .push(widget::toaster::Toast::new(fl!(
-                                    "failed-refreshing-all-accounts"
-                                )))
-                                .map(cosmic::Action::App),
-                        );
                     } else {
-                        self.sync_status = SyncStatus::Warning;
-                        commands.push(
-                            self.toasts
-                                .push(widget::toaster::Toast::new(fl!(
-                                    "failed-refreshing-accounts",
-                                    accounts = failed_accounts.join(", ")
-                                )))
-                                .map(cosmic::Action::App),
-                        );
+                        let next_account = remaining_accounts[0].clone();
+                        let remaining = remaining_accounts[1..].to_vec();
+
+                        let message = move |response: DetailedResponse| {
+                            cosmic::Action::App(ApplicationAction::DoneRefreshSingleAccount(
+                                response,
+                                remaining.clone(),
+                            ))
+                        };
+
+                        commands.push(Task::perform(
+                            provider::fetch_bookmarks_for_single_account(next_account),
+                            message,
+                        ));
                     }
                 }
             }
+
             ApplicationAction::StartRefreshBookmarksForAccount(account) => {
                 if let ApplicationState::Refreshing = self.state {
                 } else if account.enabled {
                     self.state = ApplicationState::Refreshing;
-                    let mut acc_vec = self.accounts_view.accounts.clone();
-                    acc_vec.retain(|acc| acc.id == account.id);
-                    let cloned_acc = acc_vec[0].clone();
-                    let message = move |bookmarks: Vec<DetailedResponse>| {
-                        cosmic::Action::App(ApplicationAction::DoneRefreshBookmarksForAccount(
-                            cloned_acc.clone(),
-                            bookmarks,
+
+                    self.operation_progress = Some(OperationProgress {
+                        operation_id: 0,
+                        total: 1,
+                        current: 0,
+                        operation_label: fl!("refreshing-accounts"),
+                        cancellable: false,
+                    });
+
+                    let cloned_account = account.clone();
+                    let message = move |response: DetailedResponse| {
+                        cosmic::Action::App(ApplicationAction::DoneRefreshSingleAccount(
+                            response,
+                            Vec::new(),
                         ))
                     };
+
                     commands.push(self.update(ApplicationAction::StartRefreshAccountProfile(
                         account.clone(),
                     )));
-                    if !acc_vec.is_empty() {
-                        commands.push(Task::perform(
-                            http::fetch_bookmarks_from_all_accounts(acc_vec.clone()),
-                            message,
-                        ));
-                    }
+                    commands.push(Task::perform(
+                        provider::fetch_bookmarks_for_single_account(cloned_account),
+                        message,
+                    ));
                 } else {
-                    if self.accounts_view.accounts.iter().all(|item| !item.enabled) {
-                        self.state = ApplicationState::NoEnabledAccounts;
+                    let has_enabled_remote_accounts = self
+                        .accounts_view
+                        .accounts
+                        .iter()
+                        .any(|a| a.enabled && !a.is_local_provider());
+                    if !has_enabled_remote_accounts {
+                        self.state = ApplicationState::NoEnabledRemoteAccounts;
                     }
                     commands.push(self.update(ApplicationAction::LoadBookmarks));
                 }
             }
-            ApplicationAction::DoneRefreshBookmarksForAccount(account, remote_responses) => {
-                let mut failure_refreshing = false;
-                if let Some(ref mut database) = &mut self.bookmarks_cursor.database {
-                    for response in remote_responses {
-                        if !response.successful {
-                            failure_refreshing = true;
-                        }
-                        block_on(async {
-                            db::SqliteDatabase::aggregate_bookmarks_for_account(
-                                database,
-                                &account,
-                                response.bookmarks.unwrap_or_else(Vec::new),
-                                response.timestamp,
-                                response.successful,
-                            )
-                            .await;
-                        });
-                    }
-                    commands.push(self.update(ApplicationAction::LoadAccounts));
-                    commands.push(self.update(ApplicationAction::LoadBookmarks));
-                    self.state = ApplicationState::Ready;
-                    if failure_refreshing {
-                        commands.push(
-                            self.toasts
-                                .push(widget::toaster::Toast::new(fl!(
-                                    "failed-refreshing-bookmarks-for-account",
-                                    account = account.display_name
-                                )))
-                                .map(cosmic::Action::App),
-                        );
-                    } else {
-                        commands.push(
-                            self.toasts
-                                .push(widget::toaster::Toast::new(fl!(
-                                    "refreshed-bookmarks-for-account",
-                                    acc = account.display_name
-                                )))
-                                .map(cosmic::Action::App),
-                        );
-                    }
-                }
-            }
+
             ApplicationAction::StartRefreshAccountProfile(account) => {
                 if let ApplicationState::Refreshing = self.state {
                 } else if account.enabled {
@@ -866,7 +1113,10 @@ impl Application for Cosmicding {
                             api_response,
                         ))
                     };
-                    commands.push(Task::perform(http::fetch_account_details(account), message));
+                    commands.push(Task::perform(
+                        provider::fetch_account_details(account),
+                        message,
+                    ));
                 }
             }
             ApplicationAction::DoneRefreshAccountProfile(mut account, api_response) => {
@@ -886,19 +1136,26 @@ impl Application for Cosmicding {
                 }
             }
             ApplicationAction::AddBookmarkForm => {
-                if matches!(self.state, ApplicationState::Ready) {
-                    // FIXME: (vkhitrin) this should not exist, "bypass" pagination to retrieve all
-                    //        entries from database. Need to find a better approach to generate a list
-                    //        of all accounts.
-                    self.placeholder_accounts_list =
+                if matches!(
+                    self.state,
+                    ApplicationState::Ready | ApplicationState::NoEnabledRemoteAccounts
+                ) {
+                    self.context_accounts_list =
                         tokio::runtime::Runtime::new().unwrap().block_on(async {
                             db::SqliteDatabase::select_accounts(
                                 self.bookmarks_cursor.database.as_mut().unwrap(),
                             )
                             .await
                         });
+                    self.context_accounts_list.sort_by_key(|account| {
+                        if account.is_local_provider() {
+                            1
+                        } else {
+                            0
+                        }
+                    });
                     if !self.accounts_view.accounts.is_empty() {
-                        self.placeholder_bookmark = Some(Bookmark::new(
+                        self.context_bookmark = Some(Bookmark::new(
                             None,
                             None,
                             String::new(),
@@ -918,12 +1175,11 @@ impl Application for Cosmicding {
                             None,
                             Some(true),
                         ));
-                        if !self.placeholder_bookmark_notes.text().is_empty() {
-                            self.placeholder_bookmark_notes = widget::text_editor::Content::new();
+                        if !self.context_bookmark_notes.text().is_empty() {
+                            self.context_bookmark_notes = widget::text_editor::Content::new();
                         }
-                        if !self.placeholder_bookmark_description.text().is_empty() {
-                            self.placeholder_bookmark_description =
-                                widget::text_editor::Content::new();
+                        if !self.context_bookmark_description.text().is_empty() {
+                            self.context_bookmark_description = widget::text_editor::Content::new();
                         }
                         commands.push(self.update(ApplicationAction::ToggleContextPage(
                             ContextPage::NewBookmarkForm,
@@ -932,101 +1188,143 @@ impl Application for Cosmicding {
                 }
             }
             ApplicationAction::SetAccountDisplayName(name) => {
-                if let Some(ref mut account_placeholder) = &mut self.placeholder_account {
-                    account_placeholder.display_name = name;
+                if let Some(ref mut account) = &mut self.context_account {
+                    account.display_name = name;
                 }
             }
             ApplicationAction::SetAccountInstance(url) => {
-                if let Some(ref mut account_placeholder) = &mut self.placeholder_account {
-                    account_placeholder.instance = url;
+                if let Some(ref mut account) = &mut self.context_account {
+                    account.instance = url;
                 }
             }
             ApplicationAction::SetAccountAPIKey(key) => {
-                if let Some(ref mut account_placeholder) = &mut self.placeholder_account {
-                    account_placeholder.api_token = key;
+                if let Some(ref mut account) = &mut self.context_account {
+                    account.api_token = key;
                 }
             }
             ApplicationAction::SetAccountStatus(enabled) => {
-                if let Some(ref mut account_placeholder) = &mut self.placeholder_account {
-                    account_placeholder.enabled = enabled;
+                if let Some(ref mut account) = &mut self.context_account {
+                    account.enabled = enabled;
                 }
             }
             ApplicationAction::SetAccountTrustInvalidCertificates(trust) => {
-                if let Some(ref mut account_placeholder) = &mut self.placeholder_account {
-                    account_placeholder.trust_invalid_certs = trust;
+                if let Some(ref mut account) = &mut self.context_account {
+                    account.trust_invalid_certs = trust;
+                }
+            }
+            ApplicationAction::SetAccountProvider(provider) => {
+                if let Some(ref mut account) = &mut self.context_account {
+                    account.set_provider(provider);
                 }
             }
             ApplicationAction::AddBookmarkFormAccountIndex(idx) => {
-                self.placeholder_selected_account_index = idx;
+                self.context_selected_account_index = idx;
             }
             ApplicationAction::SetBookmarkURL(url) => {
-                if let Some(ref mut bookmark_placeholder) = &mut self.placeholder_bookmark {
-                    bookmark_placeholder.url = url;
+                if let Some(ref mut bookmark) = &mut self.context_bookmark {
+                    bookmark.url = url;
                 }
             }
             ApplicationAction::SetBookmarkTitle(title) => {
-                if let Some(ref mut bookmark_placeholder) = &mut self.placeholder_bookmark {
-                    bookmark_placeholder.title = title;
+                if let Some(ref mut bookmark) = &mut self.context_bookmark {
+                    bookmark.title = title;
                 }
             }
             ApplicationAction::InputBookmarkNotes(action) => {
-                self.placeholder_bookmark_notes.perform(action);
-                if let Some(ref mut bookmark_placeholder) = &mut self.placeholder_bookmark {
-                    bookmark_placeholder.notes = self.placeholder_bookmark_notes.text();
+                self.context_bookmark_notes.perform(action);
+                if let Some(ref mut bookmark) = &mut self.context_bookmark {
+                    bookmark.notes = self.context_bookmark_notes.text().trim().to_string();
                 }
             }
             ApplicationAction::InputBookmarkDescription(action) => {
-                self.placeholder_bookmark_description.perform(action);
-                if let Some(ref mut bookmark_placeholder) = &mut self.placeholder_bookmark {
-                    bookmark_placeholder.description = self.placeholder_bookmark_description.text();
+                self.context_bookmark_description.perform(action);
+                if let Some(ref mut bookmark) = &mut self.context_bookmark {
+                    bookmark.description =
+                        self.context_bookmark_description.text().trim().to_string();
                 }
             }
             ApplicationAction::SetBookmarkTags(tags_string) => {
                 let tags: Vec<String> = if tags_string.is_empty() {
                     Vec::new()
                 } else {
-                    tags_string
-                        .split(' ')
-                        .map(|s| s.trim().to_string())
-                        .collect()
+                    tags_string.split(' ').map(|s| s.to_string()).collect()
                 };
-                if let Some(ref mut bookmark_placeholder) = &mut self.placeholder_bookmark {
-                    bookmark_placeholder.tag_names = tags;
+                if let Some(ref mut bookmark) = &mut self.context_bookmark {
+                    bookmark.tag_names = tags;
                 }
             }
             ApplicationAction::SetBookmarkArchived(archived) => {
-                if let Some(ref mut bookmark_placeholder) = &mut self.placeholder_bookmark {
-                    bookmark_placeholder.is_archived = archived;
+                if let Some(ref mut bookmark) = &mut self.context_bookmark {
+                    bookmark.is_archived = archived;
                 }
             }
             ApplicationAction::SetBookmarkUnread(unread) => {
-                if let Some(ref mut bookmark_placeholder) = &mut self.placeholder_bookmark {
-                    bookmark_placeholder.unread = unread;
+                if let Some(ref mut bookmark) = &mut self.context_bookmark {
+                    bookmark.unread = unread;
                 }
             }
             ApplicationAction::SetBookmarkShared(shared) => {
-                if let Some(ref mut bookmark_placeholder) = &mut self.placeholder_bookmark {
-                    bookmark_placeholder.shared = shared;
+                if let Some(ref mut bookmark) = &mut self.context_bookmark {
+                    bookmark.shared = shared;
                 }
             }
             // NOTE: (vkhitrin) during creation, linkding doesn't populate 'favicon_url'.
             //       In order to display the new favicon, users are required to wait a
             //       bit, and then perform a manual refresh.
-            ApplicationAction::StartAddBookmark(account, bookmark) => {
+            ApplicationAction::StartAddBookmark(
+                account,
+                mut bookmark,
+                import_context,
+                remaining_bookmarks,
+            ) => {
+                if let Some(ctx) = &import_context {
+                    let is_cancelled = match &self.operation_progress {
+                        None => true,
+                        Some(progress) => progress.operation_id != ctx.import_id,
+                    };
+
+                    if is_cancelled {
+                        log::debug!(
+                            "Skipping bookmark {} - import {} was cancelled",
+                            bookmark.url,
+                            ctx.import_id
+                        );
+                        commands.push(self.update(ApplicationAction::DoneImportBookmarks(0)));
+                        return Task::batch(commands);
+                    }
+                }
+
+                bookmark.tag_names = bookmark
+                    .tag_names
+                    .iter()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
+
                 let cloned_acc = account.clone();
+                let cloned_context = import_context.clone();
+                let cloned_remaining = remaining_bookmarks.clone();
                 let message = move |api_response: Option<BookmarkCheckDetailsResponse>| {
                     cosmic::Action::App(ApplicationAction::DoneAddBookmark(
                         cloned_acc.clone(),
                         api_response,
+                        cloned_context.clone(),
+                        cloned_remaining.clone(),
                     ))
                 };
                 commands.push(Task::perform(
-                    http::populate_bookmark(account, bookmark, true),
+                    provider::populate_bookmark(account, bookmark, true, true),
                     message,
                 ));
                 self.core.window.show_context = false;
             }
-            ApplicationAction::DoneAddBookmark(account, api_response) => {
+            ApplicationAction::DoneAddBookmark(
+                account,
+                api_response,
+                import_context,
+                mut remaining_bookmarks,
+            ) => {
                 if let Some(ref mut database) = &mut self.bookmarks_cursor.database {
                     if let Some(response) = api_response {
                         if response.error.is_none() {
@@ -1036,15 +1334,18 @@ impl Application for Cosmicding {
                                     block_on(async {
                                         db::SqliteDatabase::add_bookmark(database, &bkmrk).await;
                                     });
-                                    commands.push(
-                                        self.toasts
-                                            .push(widget::toaster::Toast::new(fl!(
-                                                "added-bookmark-to-account",
-                                                bkmrk = bkmrk.url.clone(),
-                                                acc = account.display_name
-                                            )))
-                                            .map(cosmic::Action::App),
-                                    );
+                                    // Only show toast if not importing
+                                    if import_context.is_none() {
+                                        commands.push(
+                                            self.toasts
+                                                .push(widget::toaster::Toast::new(fl!(
+                                                    "added-bookmark-to-account",
+                                                    bkmrk = bkmrk.url.clone(),
+                                                    acc = account.display_name.clone()
+                                                )))
+                                                .map(cosmic::Action::App),
+                                        );
+                                    }
                                 } else {
                                     block_on(async {
                                         db::SqliteDatabase::update_bookmark(
@@ -1052,24 +1353,64 @@ impl Application for Cosmicding {
                                         )
                                         .await;
                                     });
-                                    commands.push(
-                                        self.toasts
-                                            .push(widget::toaster::Toast::new(fl!(
-                                                "updated-bookmark-in-account",
-                                                bkmrk = bkmrk.url,
-                                                acc = account.display_name.clone()
-                                            )))
-                                            .map(cosmic::Action::App),
-                                    );
+                                    // Only show toast if not importing
+                                    if import_context.is_none() {
+                                        commands.push(
+                                            self.toasts
+                                                .push(widget::toaster::Toast::new(fl!(
+                                                    "updated-bookmark-in-account",
+                                                    bkmrk = bkmrk.url,
+                                                    acc = account.display_name.clone()
+                                                )))
+                                                .map(cosmic::Action::App),
+                                        );
+                                    }
                                 }
                                 commands.push(self.update(ApplicationAction::LoadBookmarks));
+
+                                if !remaining_bookmarks.is_empty() && import_context.is_some() {
+                                    if let Some(ref mut progress) = self.operation_progress {
+                                        progress.current += 1;
+                                    }
+
+                                    let (next_bookmark, next_context) =
+                                        remaining_bookmarks.remove(0);
+                                    commands.push(self.update(
+                                        ApplicationAction::StartAddBookmark(
+                                            account.clone(),
+                                            next_bookmark,
+                                            Some(next_context),
+                                            remaining_bookmarks.clone(),
+                                        ),
+                                    ));
+                                } else if let Some(ctx) = &import_context {
+                                    self.operation_progress = None;
+                                    commands.push(self.update(
+                                        ApplicationAction::DoneImportBookmarks(ctx.total_count),
+                                    ));
+                                }
                             }
                         } else {
                             commands.push(
                                 self.toasts
-                                    .push(widget::toaster::Toast::new(response.error.unwrap()))
+                                    .push(widget::toaster::Toast::new(
+                                        response.error.clone().unwrap(),
+                                    ))
                                     .map(cosmic::Action::App),
                             );
+
+                            // Cancel remaining imports
+                            if let Some(ctx) = &import_context {
+                                let remaining_count = remaining_bookmarks.len();
+                                log::error!(
+                                    "Bookmark import failed: {}. Cancelling remaining {} imports.",
+                                    response.error.unwrap(),
+                                    remaining_count
+                                );
+                                commands.push(self.update(
+                                    ApplicationAction::CancelImportBookmarks(ctx.import_id),
+                                ));
+                            }
                         }
                     }
                 }
@@ -1089,7 +1430,7 @@ impl Application for Cosmicding {
                         ))
                     };
                     commands.push(Task::perform(
-                        http::remove_bookmark(account, bookmark),
+                        provider::remove_bookmark(account, bookmark),
                         message,
                     ));
                 }
@@ -1132,33 +1473,41 @@ impl Application for Cosmicding {
                 }
             }
             ApplicationAction::EditBookmarkForm(account_id, bookmark) => {
-                self.placeholder_bookmark = Some(bookmark.clone());
-                self.placeholder_bookmark_notes = widget::text_editor::Content::with_text(
-                    &self.placeholder_bookmark.as_ref().unwrap().notes,
+                self.context_bookmark = Some(bookmark.clone());
+                self.context_bookmark_notes = widget::text_editor::Content::with_text(
+                    &self.context_bookmark.as_ref().unwrap().notes,
                 );
-                self.placeholder_bookmark_description = widget::text_editor::Content::with_text(
-                    &self.placeholder_bookmark.as_ref().unwrap().description,
+                self.context_bookmark_description = widget::text_editor::Content::with_text(
+                    &self.context_bookmark.as_ref().unwrap().description,
                 );
                 if let Some(ref mut database) = &mut self.bookmarks_cursor.database {
                     let account: Account = block_on(async {
                         db::SqliteDatabase::select_single_account(database, account_id).await
                     });
-                    self.placeholder_account = Some(account);
+                    self.context_account = Some(account);
                 }
                 commands.push(self.update(ApplicationAction::ToggleContextPage(
                     ContextPage::EditBookmarkForm,
                 )));
             }
-            ApplicationAction::StartEditBookmark(account, bookmark) => {
+            ApplicationAction::StartEditBookmark(account, mut bookmark) => {
+                bookmark.tag_names = bookmark
+                    .tag_names
+                    .iter()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
+
                 let cloned_acc = account.clone();
                 let message = move |api_response: Option<BookmarkCheckDetailsResponse>| {
-                    cosmic::Action::App(ApplicationAction::DoneAddBookmark(
+                    cosmic::Action::App(ApplicationAction::DoneEditBookmark(
                         cloned_acc.clone(),
                         api_response,
                     ))
                 };
                 commands.push(Task::perform(
-                    http::populate_bookmark(account, bookmark, false),
+                    provider::populate_bookmark(account, bookmark, false, false),
                     message,
                 ));
                 self.core.window.show_context = false;
@@ -1211,7 +1560,7 @@ impl Application for Cosmicding {
                 }
             }
             ApplicationAction::ViewBookmarkNotes(bookmark) => {
-                self.placeholder_bookmark_notes =
+                self.context_bookmark_notes =
                     widget::text_editor::Content::with_text(&bookmark.notes);
                 commands.push(self.update(ApplicationAction::ToggleContextPage(
                     ContextPage::ViewBookmarkNotes,
@@ -1267,12 +1616,346 @@ impl Application for Cosmicding {
                             commands.push(self.update(ApplicationAction::PurgeFaviconsCache));
                             commands.push(self.update(ApplicationAction::LoadBookmarks));
                         }
+                        DialogPage::ExportBookmarks(_, _, _)
+                        | DialogPage::ImportBookmarks(_, _, _) => {}
                     }
                 }
                 commands.push(self.update(ApplicationAction::LoadAccounts));
             }
             ApplicationAction::DialogCancel => {
                 self.dialog_pages.pop_front();
+            }
+            ApplicationAction::StartExportBookmarks => {
+                let enabled_accounts: Vec<Account> = self
+                    .accounts_view
+                    .accounts
+                    .iter()
+                    .filter(|acc| acc.enabled)
+                    .cloned()
+                    .collect();
+
+                if !enabled_accounts.is_empty() {
+                    let selected = vec![false; enabled_accounts.len()];
+                    if self.dialog_pages.pop_front().is_none() {
+                        self.dialog_pages.push_back(DialogPage::ExportBookmarks(
+                            enabled_accounts,
+                            selected,
+                            None,
+                        ));
+                    }
+                }
+            }
+            ApplicationAction::ExportBookmarksSelectAccounts(selected) => {
+                if let Some(DialogPage::ExportBookmarks(accounts, _, path)) =
+                    self.dialog_pages.front()
+                {
+                    self.dialog_pages[0] =
+                        DialogPage::ExportBookmarks(accounts.clone(), selected, path.clone());
+                }
+            }
+            ApplicationAction::StartImportBookmarks => {
+                let enabled_accounts: Vec<Account> = self
+                    .accounts_view
+                    .accounts
+                    .iter()
+                    .filter(|acc| acc.enabled)
+                    .cloned()
+                    .collect();
+
+                if !enabled_accounts.is_empty() && self.dialog_pages.pop_front().is_none() {
+                    self.dialog_pages.push_back(DialogPage::ImportBookmarks(
+                        enabled_accounts,
+                        0,
+                        None,
+                    ));
+                }
+            }
+            ApplicationAction::ImportBookmarksSelectAccount(idx) => {
+                if let Some(DialogPage::ImportBookmarks(accounts, _, path)) =
+                    self.dialog_pages.front()
+                {
+                    self.dialog_pages[0] =
+                        DialogPage::ImportBookmarks(accounts.clone(), idx, path.clone());
+                }
+            }
+            ApplicationAction::SelectExportPath => {
+                commands.push(Task::perform(
+                    async { open_save_file_dialog("cosmicding_bookmarks_export.html").await },
+                    |path| cosmic::Action::App(ApplicationAction::SetExportPath(path)),
+                ));
+            }
+            ApplicationAction::SelectImportPath => {
+                commands.push(Task::perform(async { open_file_dialog().await }, |path| {
+                    cosmic::Action::App(ApplicationAction::SetImportPath(path))
+                }));
+            }
+            ApplicationAction::SetExportPath(path) => {
+                if let Some(DialogPage::ExportBookmarks(accounts, selected, _)) =
+                    self.dialog_pages.front()
+                {
+                    self.dialog_pages[0] =
+                        DialogPage::ExportBookmarks(accounts.clone(), selected.clone(), path);
+                }
+            }
+            ApplicationAction::SetImportPath(path) => {
+                if let Some(DialogPage::ImportBookmarks(accounts, idx, _)) =
+                    self.dialog_pages.front()
+                {
+                    self.dialog_pages[0] =
+                        DialogPage::ImportBookmarks(accounts.clone(), *idx, path);
+                }
+            }
+            ApplicationAction::PerformExportBookmarks(accounts) => {
+                let export_path_from_dialog = if let Some(DialogPage::ExportBookmarks(_, _, path)) =
+                    self.dialog_pages.front()
+                {
+                    path.clone()
+                } else {
+                    None
+                };
+
+                self.dialog_pages.pop_front();
+
+                if let Some(ref mut database) = &mut self.bookmarks_cursor.database {
+                    let account_ids: Vec<i64> = accounts.iter().filter_map(|acc| acc.id).collect();
+
+                    block_on(async {
+                        let total_count = database.count_bookmarks_entries().await;
+
+                        let mut all_bookmarks: Vec<Bookmark> = Vec::new();
+                        let limit: u8 = 255;
+                        let mut offset: usize = 0;
+
+                        while offset < total_count {
+                            let bookmarks = database
+                                .select_bookmarks_with_limit(
+                                    limit,
+                                    offset,
+                                    self.bookmarks_cursor.sort_option,
+                                )
+                                .await;
+
+                            if bookmarks.is_empty() {
+                                break;
+                            }
+
+                            all_bookmarks.extend(bookmarks);
+                            offset += limit as usize;
+                        }
+
+                        let filtered_bookmarks: Vec<Bookmark> = all_bookmarks
+                            .into_iter()
+                            .filter(|bm| {
+                                if let Some(user_account_id) = bm.user_account_id {
+                                    account_ids.contains(&user_account_id)
+                                } else {
+                                    false
+                                }
+                            })
+                            .collect();
+
+                        let bookmark_count = filtered_bookmarks.len();
+
+                        let html_content = bookmark_parser::netscape::BookmarkIO::generate(
+                            &filtered_bookmarks,
+                            bookmark_parser::netscape::BookmarkFormat::Netscape,
+                        );
+
+                        if let Some(export_path) = export_path_from_dialog {
+                            match std::fs::write(&export_path, html_content) {
+                                Ok(()) => {
+                                    commands.push(
+                                        self.toasts
+                                            .push(widget::toaster::Toast::new(fl!(
+                                                "export-bookmarks-success",
+                                                count = bookmark_count,
+                                                path = export_path.display().to_string()
+                                            )))
+                                            .map(cosmic::Action::App),
+                                    );
+                                }
+                                Err(e) => {
+                                    commands.push(
+                                        self.toasts
+                                            .push(widget::toaster::Toast::new(fl!(
+                                                "export-bookmarks-error",
+                                                error = e.to_string()
+                                            )))
+                                            .map(cosmic::Action::App),
+                                    );
+                                }
+                            }
+                        } else {
+                            commands.push(
+                                self.toasts
+                                    .push(widget::toaster::Toast::new(fl!(
+                                        "export-bookmarks-no-path"
+                                    )))
+                                    .map(cosmic::Action::App),
+                            );
+                        }
+                    });
+                }
+            }
+            ApplicationAction::PerformImportBookmarks(account) => {
+                let import_path_from_dialog = if let Some(DialogPage::ImportBookmarks(_, _, path)) =
+                    self.dialog_pages.front()
+                {
+                    path.clone()
+                } else {
+                    None
+                };
+
+                self.dialog_pages.pop_front();
+
+                self.state = ApplicationState::Refreshing;
+
+                if let Some(import_path) = import_path_from_dialog {
+                    if import_path.exists() {
+                        match std::fs::read_to_string(&import_path) {
+                            Ok(html_content) => {
+                                match bookmark_parser::netscape::BookmarkIO::parse(
+                                    &html_content,
+                                    bookmark_parser::netscape::BookmarkFormat::Netscape,
+                                ) {
+                                    Ok(bookmarks) => {
+                                        let import_count = bookmarks.len();
+                                        if import_count == 0 {
+                                            commands.push(
+                                                self.toasts
+                                                    .push(widget::toaster::Toast::new(fl!(
+                                                        "import-bookmarks-error",
+                                                        error = "No bookmarks found"
+                                                    )))
+                                                    .map(cosmic::Action::App),
+                                            );
+                                            commands.push(
+                                                self.update(
+                                                    ApplicationAction::DoneImportBookmarks(0),
+                                                ),
+                                            );
+                                        } else {
+                                            let import_id = SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_nanos()
+                                                as u64;
+
+                                            let mut bookmarks_with_context: Vec<(
+                                                Bookmark,
+                                                ImportAction,
+                                            )> = bookmarks
+                                                .into_iter()
+                                                .enumerate()
+                                                .map(|(index, bookmark)| {
+                                                    let import_context = ImportAction {
+                                                        import_id,
+                                                        total_count: import_count,
+                                                        current_index: index,
+                                                    };
+                                                    (bookmark, import_context)
+                                                })
+                                                .collect();
+
+                                            let (first_bookmark, first_context) =
+                                                bookmarks_with_context.remove(0);
+
+                                            self.operation_progress = Some(OperationProgress {
+                                                operation_id: import_id,
+                                                total: import_count,
+                                                current: 0,
+                                                operation_label: fl!("importing-bookmarks"),
+                                                cancellable: true,
+                                            });
+
+                                            commands.push(self.update(
+                                                ApplicationAction::StartAddBookmark(
+                                                    account.clone(),
+                                                    first_bookmark,
+                                                    Some(first_context),
+                                                    bookmarks_with_context,
+                                                ),
+                                            ));
+
+                                            commands.push(
+                                                self.toasts
+                                                    .push(widget::toaster::Toast::new(fl!(
+                                                        "import-bookmarks-started",
+                                                        count = import_count
+                                                    )))
+                                                    .map(cosmic::Action::App),
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        commands.push(
+                                            self.toasts
+                                                .push(widget::toaster::Toast::new(fl!(
+                                                    "import-bookmarks-error",
+                                                    error = e.to_string()
+                                                )))
+                                                .map(cosmic::Action::App),
+                                        );
+                                        commands.push(
+                                            self.update(ApplicationAction::DoneImportBookmarks(0)),
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                commands.push(
+                                    self.toasts
+                                        .push(widget::toaster::Toast::new(fl!(
+                                            "import-bookmarks-error",
+                                            error = e.to_string()
+                                        )))
+                                        .map(cosmic::Action::App),
+                                );
+                                commands
+                                    .push(self.update(ApplicationAction::DoneImportBookmarks(0)));
+                            }
+                        }
+                    } else {
+                        commands.push(
+                            self.toasts
+                                .push(widget::toaster::Toast::new(fl!(
+                                    "import-bookmarks-file-not-found",
+                                    path = import_path.display().to_string()
+                                )))
+                                .map(cosmic::Action::App),
+                        );
+                        commands.push(self.update(ApplicationAction::DoneImportBookmarks(0)));
+                    }
+                } else {
+                    commands.push(
+                        self.toasts
+                            .push(widget::toaster::Toast::new(fl!("import-bookmarks-no-path")))
+                            .map(cosmic::Action::App),
+                    );
+                    commands.push(self.update(ApplicationAction::DoneImportBookmarks(0)));
+                }
+            }
+            ApplicationAction::CancelImportBookmarks(import_id) => {
+                log::info!("Import {} cancelled", import_id);
+
+                self.operation_progress = None;
+
+                commands.push(self.update(ApplicationAction::DoneImportBookmarks(0)));
+            }
+            ApplicationAction::DoneImportBookmarks(count) => {
+                self.state = ApplicationState::Ready;
+                self.operation_progress = None;
+
+                if count > 0 {
+                    commands.push(
+                        self.toasts
+                            .push(widget::toaster::Toast::new(fl!(
+                                "import-bookmarks-finished",
+                                count = count
+                            )))
+                            .map(cosmic::Action::App),
+                    );
+                }
             }
             ApplicationAction::CloseToast(id) => {
                 self.toasts.remove(id);
@@ -1383,7 +2066,7 @@ impl Application for Cosmicding {
                                         )
                                     };
                                     commands.push(Task::perform(
-                                        http::fetch_bookmark_favicon(favicon_url_clone.clone()),
+                                        provider::fetch_bookmark_favicon(favicon_url_clone.clone()),
                                         message,
                                     ));
                                 }
@@ -1421,8 +2104,11 @@ impl Application for Cosmicding {
             }
             ApplicationAction::StartupCompleted => {
                 for account in self.accounts_view.accounts.clone() {
-                    commands
-                        .push(self.update(ApplicationAction::StartRefreshAccountProfile(account)));
+                    if !account.is_local_provider() {
+                        commands.push(
+                            self.update(ApplicationAction::StartRefreshAccountProfile(account)),
+                        );
+                    }
                 }
                 commands.push(Task::perform(
                     async {
@@ -1434,8 +2120,10 @@ impl Application for Cosmicding {
                 ));
             }
             ApplicationAction::SearchActivate => {
-                if let ApplicationState::NoEnabledAccounts = self.state {
-                } else {
+                if matches!(
+                    self.state,
+                    ApplicationState::Ready | ApplicationState::NoEnabledRemoteAccounts
+                ) {
                     return widget::text_input::focus(self.search_id.clone());
                 }
             }
@@ -1454,7 +2142,7 @@ impl Application for Cosmicding {
 
 impl Cosmicding {
     #[allow(clippy::unused_self)]
-    fn settings(&self) -> Element<ApplicationAction> {
+    fn settings(&self) -> Element<'_, ApplicationAction> {
         widget::settings::view_column(vec![
             widget::settings::section()
                 .title(fl!("appearance"))

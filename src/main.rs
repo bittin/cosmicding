@@ -1,11 +1,12 @@
 mod app;
 mod core;
 mod db;
-mod http;
 mod models;
 mod pages;
+mod provider;
 mod style;
 mod utils;
+mod widgets;
 
 use core::settings;
 
